@@ -4,7 +4,7 @@ import requests
 from telegram import Bot
 
 # ================= CONFIGURATION =================
-TELEGRAM_BOT_TOKEN = "8804502384:AAFrkIaOJzd7oDZeQ1HNcmPmg3fnkHgGAVM"
+TELEGRAM_BOT_TOKEN = "8804502384:AAEX_2FuTb4PAmT7rVk_T7Qpq695T5JExKw"
 TELEGRAM_CHAT_ID = "5642314005"
 
 CHAIN = "solana"
