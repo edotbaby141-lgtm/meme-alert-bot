@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import requests
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+import os
 from telegram import Bot
 
 # ================= CONFIGURATION =================
@@ -10,21 +13,35 @@ TELEGRAM_CHAT_ID = "5642314005"
 CHAIN = "solana"
 CHECK_INTERVAL_SECONDS = 30
 MIN_LIQUIDITY_USD = 10000
-MAX_LIQUIDITY_USD = 150000
-MIN_5M_VOLUME = 5000
-MIN_BUYS_5M = 15
+MAX_LIQUIDITY_USD = 1000000
+MIN_5M_VOLUME = 15000
+MIN_BUYS_5M = 30
 # =================================================
 
-seen_tokens = set()
+active_positions = set()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Lightweight HTTP server to satisfy Render's port check
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def run_health_check_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
 async def main():
+    threading.Thread(target=run_health_check_server, daemon=True).start()
+
     token = TELEGRAM_BOT_TOKEN.strip()
     chat_id = str(TELEGRAM_CHAT_ID).strip()
     bot = Bot(token=token)
     
     try:
-        await bot.send_message(chat_id=chat_id, text="🟢 **Early Pump Bot Activated.** Monitoring market...")
+        await bot.send_message(chat_id=chat_id, text="🟢 **Signal Engine Online.** Scanning market...")
         logging.info("Startup alert sent successfully.")
     except Exception as e:
         logging.error(f"Startup failed: {e}")
@@ -45,30 +62,60 @@ async def main():
                     
                     for pair in pairs:
                         pair_addr = pair.get('pairAddress')
-                        if pair_addr in seen_tokens:
-                            continue
-                            
+                        symbol = pair.get('baseToken', {}).get('symbol', 'UNKNOWN')
+                        dex_url = pair.get('url', '')
+                        token_addr = pair.get('baseToken', {}).get('address', '')
+                        
                         liquidity = pair.get('liquidity', {}).get('usd', 0)
                         vol_5m = pair.get('volume', {}).get('m5', 0)
                         buys_5m = pair.get('txns', {}).get('m5', {}).get('buys', 0)
-                        
-                        if (MIN_LIQUIDITY_USD <= liquidity <= MAX_LIQUIDITY_USD and 
-                            vol_5m >= MIN_5M_VOLUME and buys_5m >= MIN_BUYS_5M):
-                            
-                            symbol = pair.get('baseToken', {}).get('symbol', 'UNKNOWN')
-                            dex_url = pair.get('url', '')
-                            token_addr = pair.get('baseToken', {}).get('address', '')
-                            
-                            msg = (
-                                f"🚀 **EARLY VOLUME PUMP DETECTED** 🚀\n\n"
-                                f"**Token:** `${symbol}`\n"
-                                f"**5m Volume:** `${vol_5m:,.2f}`\n"
-                                f"**Liquidity:** `${liquidity:,.2f}`\n\n"
-                                f"📍 [View DEXScreener]({dex_url})\n"
-                                f"📋 `{token_addr}`"
-                            )
-                            await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-                            seen_tokens.add(pair_addr)
+                        sells_5m = pair.get('txns', {}).get('m5', {}).get('sells', 0)
+                        total_txns = buys_5m + sells_5m
+
+                        # 🟢 TAKE POSITION TRIGGER: Strong Volume + Dominant Buy Ratio
+                        if pair_addr not in active_positions:
+                            if (MIN_LIQUIDITY_USD <= liquidity <= MAX_LIQUIDITY_USD and 
+                                vol_5m >= MIN_5M_VOLUME and buys_5m >= MIN_BUYS_5M):
+                                
+                                buy_ratio = (buys_5m / total_txns) * 100 if total_txns > 0 else 0
+                                if buy_ratio >= 65:  # At least 65% buys
+                                    msg = (
+                                        f"🟢 **TAKE POSITION (ENTRY SIGNAL)** 🟢\n\n"
+                                        f"**Token:** `${symbol}`\n"
+                                        f"**5m Volume:** `${vol_5m:,.2f}`\n"
+                                        f"**Liquidity:** `${liquidity:,.2f}`\n"
+                                        f"**Buy Ratio:** `{buy_ratio:.1f}%` ({buys_5m} buys / {sells_5m} sells)\n\n"
+                                        f"📍 [View DEXScreener]({dex_url})\n"
+                                        f"📋 `{token_addr}`"
+                                    )
+                                    await bot.send_message(
+                                        chat_id=chat_id, 
+                                        text=msg, 
+                                        parse_mode="Markdown", 
+                                        disable_web_page_preview=True
+                                    )
+                                    active_positions.add(pair_addr)
+
+                        # 🔴 STEP OUT TRIGGER: Heavy Sell Pressure / Market Crashing
+                        elif pair_addr in active_positions:
+                            sell_ratio = (sells_5m / total_txns) * 100 if total_txns > 0 else 0
+                            if sell_ratio >= 60 or vol_5m < (MIN_5M_VOLUME / 2):  # Sell pressure or volume drop
+                                msg = (
+                                    f"🔴 **STEP OUT (EXIT SIGNAL)** 🔴\n\n"
+                                    f"**Token:** `${symbol}`\n"
+                                    f"**Alert:** Market momentum crashing or heavy selling detected!\n"
+                                    f"**Sell Pressure:** `{sell_ratio:.1f}%` sells in last 5m\n\n"
+                                    f"📍 [View DEXScreener]({dex_url})\n"
+                                    f"📋 `{token_addr}`"
+                                )
+                                await bot.send_message(
+                                    chat_id=chat_id, 
+                                    text=msg, 
+                                    parse_mode="Markdown", 
+                                    disable_web_page_preview=True
+                                )
+                                active_positions.remove(pair_addr)
+
         except Exception as e:
             logging.error(f"Loop exception caught: {e}")
             
