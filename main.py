@@ -228,16 +228,19 @@ async def scanner_loop(app: Application):
                                     )
                                     active_positions.add(pair_addr)
 
-                        # EXIT SIGNAL
+                        # 🔴 REFINED EXIT SIGNAL (Prevents Premature Exits)
                         elif pair_addr in active_positions:
                             sell_ratio = (sells_5m / total_txns) * 100 if total_txns > 0 else 0
-                            if sell_ratio >= 60 or vol_5m < (MIN_5M_VOLUME / 2):
+                            
+                            # Requires sustained heavy sell pressure (75%+) AND a mini transaction threshold (>=10 txns)
+                            # Eliminates rolling 5-minute volume decay triggers.
+                            if sell_ratio >= 75 and total_txns >= 10:
                                 msg = (
                                     f"🔴 **STEP OUT (EXIT SIGNAL)** 🔴\n\n"
                                     f"**Chain:** `{chain_id}`\n"
                                     f"**Token:** `${symbol}`\n"
-                                    f"**Alert:** Heavy sell-off / drop in momentum detected!\n"
-                                    f"**Sell Pressure:** `{sell_ratio:.1f}%` sells in last 5m\n\n"
+                                    f"**Alert:** Heavy sell-off detected!\n"
+                                    f"**Sell Pressure:** `{sell_ratio:.1f}%` sells in last 5m ({sells_5m}/{total_txns} txns)\n\n"
                                     f"📍 [View DEXScreener]({dex_url})\n"
                                     f"📋 `{token_addr}`"
                                 )
@@ -256,24 +259,20 @@ async def scanner_loop(app: Application):
 
 # ================= MAIN ASYNC RUNNER =================
 async def main_async():
-    # 1. Initialize Bot Application
     token = TELEGRAM_BOT_TOKEN.strip()
     app = Application.builder().token(token).build()
 
-    # 2. Add Message Handler for incoming contract addresses
+    # Message handler for live contract inputs
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, analyze_custom_address))
 
-    # 3. Start Bot polling and background scanner task together
     async with app:
         await app.start()
         await app.updater.start_polling()
         
-        # Schedule the scanner loop as an asynchronous background task
+        # Non-blocking scanner task running concurrently
         asyncio.create_task(scanner_loop(app))
         
         logging.info("Multi-chain Scanner and Interactive Bot live concurrently...")
-        
-        # Keep execution running
         await asyncio.Event().wait()
 
 def main():
