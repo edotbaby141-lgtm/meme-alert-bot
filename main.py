@@ -10,7 +10,7 @@ from telegram import Bot
 TELEGRAM_BOT_TOKEN = "8804502384:AAEX_2FuTb4PAmT7rVk_T7Qpq695T5JExKw"
 TELEGRAM_CHAT_ID = "5642314005"
 
-# Multi-chain targets including Robinhood
+# Target chains supported on DEXScreener
 TARGET_CHAINS = {"solana", "base", "ethereum", "bsc", "robinhood"}
 CHECK_INTERVAL_SECONDS = 30
 
@@ -19,8 +19,15 @@ MAX_LIQUIDITY_USD = 1000000
 MIN_5M_VOLUME = 5000       # Fast test threshold ($5k)
 MIN_BUYS_5M = 15          # Fast test threshold (15 buys)
 
-# Keywords to detect AI-focused tokens
-AI_KEYWORDS = ["ai", "gpt", "agent", "neural", "intel", "mind", "bot", "claude", "solana-ai", "terminal"]
+# Extended keywords and top trending coins
+TRENDING_AND_AI_KEYWORDS = [
+    # AI Keywords
+    "ai", "gpt", "agent", "neural", "intel", "mind", "bot", "claude", "solana-ai", "terminal",
+    # Trending & Popular Tokens
+    "ake", "pons", "cashcat", "arb", "hype", "uni", "up", "pengu", "lit", "ena", "eth", "pi", "pump", "xmr", "zec",
+    "tao", "aixbt", "fet", "render", "goat", "popcat", "brett", "toshi", "mog", "spx", "sui", "neiro", "bonk",
+    "aave", "pendle", "ray", "jup", "aero", "inj", "tia", "sei", "near", "op"
+]
 # =================================================
 
 active_positions = set()
@@ -37,10 +44,10 @@ def run_health_check_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-def is_ai_token(symbol, name, description=""):
-    """Check if token symbol, name, or description contains AI keywords."""
+def is_priority_token(symbol, name, description=""):
+    """Check if token matches AI or top trending keywords."""
     text = f"{symbol} {name} {description}".lower()
-    return any(keyword in text for keyword in AI_KEYWORDS)
+    return any(keyword in text for keyword in TRENDING_AND_AI_KEYWORDS)
 
 async def main():
     threading.Thread(target=run_health_check_server, daemon=True).start()
@@ -52,7 +59,7 @@ async def main():
     try:
         await bot.send_message(
             chat_id=chat_id, 
-            text="🟢 **Multi-Chain & AI Signal Engine Online.**\nScanning Solana, Base, ETH, BSC, Robinhood..."
+            text="🟢 **Multi-Chain Signal Engine Online.**\nScanning Solana, Base, ETH, BSC & Robinhood with Trending/AI filter..."
         )
         logging.info("Startup alert sent successfully.")
     except Exception as e:
@@ -66,9 +73,17 @@ async def main():
             if res.status_code == 200:
                 profiles = res.json()
                 
-                # Filter profiles matching target chains
-                target_profiles = [p for p in profiles if p.get('chainId') in TARGET_CHAINS][:25]
-                addresses = [p['tokenAddress'] for p in target_profiles]
+                # Balanced sampling across target chains
+                chain_counts = {chain: 0 for chain in TARGET_CHAINS}
+                balanced_profiles = []
+                
+                for p in profiles:
+                    chain = p.get('chainId', '').lower()
+                    if chain in TARGET_CHAINS and chain_counts[chain] < 5:
+                        balanced_profiles.append(p)
+                        chain_counts[chain] += 1
+
+                addresses = [p['tokenAddress'] for p in balanced_profiles]
                 
                 if addresses:
                     pairs_url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(addresses)}"
@@ -90,10 +105,10 @@ async def main():
                         sells_5m = pair.get('txns', {}).get('m5', {}).get('sells', 0)
                         total_txns = buys_5m + sells_5m
 
-                        # Check if token is AI-related
-                        ai_flag = "🤖 **AI TOKEN DETECTED** 🤖\n" if is_ai_token(symbol, name) else ""
+                        # Check for AI / Trending token match
+                        ai_flag = "🤖 **AI / TRENDING TOKEN DETECTED** 🤖\n" if is_priority_token(symbol, name) else ""
 
-                        # 🟢 ENTRY SIGNAL: Meets volume/liquidity & Buy Ratio >= 65%
+                        # 🟢 ENTRY SIGNAL
                         if pair_addr not in active_positions:
                             if (MIN_LIQUIDITY_USD <= liquidity <= MAX_LIQUIDITY_USD and 
                                 vol_5m >= MIN_5M_VOLUME and buys_5m >= MIN_BUYS_5M):
@@ -102,7 +117,7 @@ async def main():
                                 if buy_ratio >= 65:
                                     msg = (
                                         f"🟢 **TAKE POSITION (ENTRY SIGNAL)** 🟢\n"
-                                        f"{ai_flag}\n"
+                                        f"{ai_flag}"
                                         f"**Chain:** `{chain_id}`\n"
                                         f"**Token:** `${symbol}` ({name})\n"
                                         f"**5m Volume:** `${vol_5m:,.2f}`\n"
@@ -119,7 +134,7 @@ async def main():
                                     )
                                     active_positions.add(pair_addr)
 
-                        # 🔴 EXIT SIGNAL: Sell Pressure >= 60% or Volume drops below threshold
+                        # 🔴 EXIT SIGNAL
                         elif pair_addr in active_positions:
                             sell_ratio = (sells_5m / total_txns) * 100 if total_txns > 0 else 0
                             if sell_ratio >= 60 or vol_5m < (MIN_5M_VOLUME / 2):
