@@ -14,7 +14,6 @@ TELEGRAM_CHAT_ID = "5642314005"
 TARGET_CHAINS = {"solana", "base", "ethereum", "bsc", "robinhood"}
 CHECK_INTERVAL_SECONDS = 30
 
-# Updated Risk Guards: Raised min liquidity to avoid thin pool dumps
 MIN_LIQUIDITY_USD = 20000
 MAX_LIQUIDITY_USD = 1000000
 MIN_5M_VOLUME = 5000
@@ -48,9 +47,10 @@ def is_priority_token(symbol, name, description=""):
     text = f"{symbol} {name} {description}".lower()
     return any(keyword in text for keyword in TRENDING_AND_AI_KEYWORDS)
 
-def calculate_holding_projection(vol_5m, liquidity, buy_ratio, test_amount=100):
+def calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, test_amount=100):
     v_l_ratio = vol_5m / liquidity if liquidity > 0 else 0
     
+    # Target Multiplier
     if v_l_ratio > 0.5 and buy_ratio >= 80:
         tier = "🔥 **ULTRA HIGH MOMENTUM (3x - 5x Potential)**"
         multiplier = 3.0
@@ -63,11 +63,22 @@ def calculate_holding_projection(vol_5m, liquidity, buy_ratio, test_amount=100):
         
     projected_value = test_amount * multiplier
     profit = projected_value - test_amount
-    
+
+    # Dynamic Holding Time Logic
+    if v_l_ratio >= 1.5 or total_txns > 200:
+        holding_time = "⚡ **2 to 5 MINUTES** *(High Volatility Scalp — Take profits quickly!)*"
+    elif 0.5 <= v_l_ratio < 1.5 or (100 <= total_txns <= 200):
+        holding_time = "⏱️ **10 to 30 MINUTES** *(Standard Momentum Push — Watch sell volume)*"
+    elif liquidity >= 50000 and buy_ratio >= 60:
+        holding_time = "⏳ **1 to 4 HOURS** *(Stable Liquidity Pool — Can sustain a multi-hour trend)*"
+    else:
+        holding_time = "⏱️ **5 to 15 MINUTES** *(Micro-Cap Move — Lock profits on resistance)*"
+
     return (
         f"{tier}\n"
         f"• **Initial Hold ($100):** `${test_amount:,.2f}`\n"
         f"• **Est. Value at Target:** `${projected_value:,.2f}` (`+${profit:,.2f}`)\n"
+        f"• **Estimated Hold Duration:** {holding_time}\n"
         f"• **Take Profit Targets:** 1.5x (`$150`) | 2x (`$200`) | 3x (`$300`)"
     )
 
@@ -104,13 +115,13 @@ def fetch_multi_source_addresses():
 
 # ================= INTERACTIVE MESSAGE HANDLER =================
 async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes pasted token contract addresses with clear Strong (Buy) / Neutral / Weak (Avoid) signals."""
+    """Processes pasted token contract addresses with clear Strong/Weak signals & holding duration."""
     token_addr = update.message.text.strip()
     
     if token_addr.startswith("/"):
         return
 
-    await update.message.reply_text(f"🔎 **Analyzing Token Strength & Signal:**\n`{token_addr}`...", parse_mode="Markdown")
+    await update.message.reply_text(f"🔎 **Analyzing Token Strength & Holding Window:**\n`{token_addr}`...", parse_mode="Markdown")
 
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}"
@@ -140,11 +151,9 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
             price_change_5m = pair.get('priceChange', {}).get('m5', 0.0)
             price_change_1h = pair.get('priceChange', {}).get('h1', 0.0)
 
-            # ================= STRENGTH & SIGNAL ENGINE =================
             weakness_reasons = []
             strength_reasons = []
 
-            # Check Weakness Criteria
             if liquidity < 20000:
                 weakness_reasons.append("• **Thin Liquidity**: Under $20k depth (high slippage risk)")
             if liquidity / vol_5m < 0.25 if vol_5m > 0 else False:
@@ -156,7 +165,6 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
             if price_change_5m < -2.0 or price_change_1h < -5.0:
                 weakness_reasons.append(f"• **Downtrending Price**: 5m: `{price_change_5m:+.1f}%` | 1h: `{price_change_1h:+.1f}%`")
 
-            # Check Strength Criteria
             if liquidity >= 20000 and (liquidity / vol_5m >= 0.25 if vol_5m > 0 else True):
                 strength_reasons.append(f"• **Solid Liquidity Depth**: `${liquidity:,.2f}` pool size")
             if buy_ratio >= 65 and total_txns >= 5:
@@ -166,7 +174,6 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
             if vol_5m >= MIN_5M_VOLUME:
                 strength_reasons.append(f"• **Active Volume Spike**: `${vol_5m:,.2f}` in last 5m")
 
-            # Evaluate Final Output Rating & Action Signal
             if len(strength_reasons) >= 3 and len(weakness_reasons) == 0:
                 strength_rating = "🟢 **STRONG / HIGH MOMENTUM**"
                 action_signal = "🟢 **ACTION: TAKE ENTRY / BUY SIGNAL**\n*Reason: Healthy volume, stable pool liquidity, and non-extended price breakout.*"
@@ -178,7 +185,7 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
                 action_signal = "⏳ **ACTION: WAIT FOR CONFIRMATION**\n*Reason: Mixed metrics. Added to background monitoring for a volume burst.*"
 
             custom_tracked_tokens.add(token_addr)
-            projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio)
+            projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns)
             ai_flag = "🤖 **AI / TRENDING TOKEN DETECTED** 🤖\n" if is_priority_token(symbol, name) else ""
 
             msg = (
@@ -202,7 +209,7 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
                 msg += "⚠️ **Weakness Factors:**\n" + "\n".join(weakness_reasons) + "\n\n"
 
             msg += (
-                f"📊 **HOLDING VALUE FORECAST ($100 Hold):**\n"
+                f"📊 **HOLDING VALUE & DURATION FORECAST:**\n"
                 f"{projections}\n\n"
                 f"📍 [View DEXScreener]({dex_url})"
             )
@@ -249,7 +256,7 @@ async def scanner_loop(app: Application):
 
                         ai_flag = "🤖 **AI / TRENDING TOKEN DETECTED** 🤖\n" if is_priority_token(symbol, name) else ""
 
-                        # STRICT ENTRY SIGNAL GUARD (Prevents local top buying)
+                        # ENTRY SIGNAL WITH DURATION ESTIMATE
                         if pair_addr not in active_positions:
                             liquidity_to_vol_ratio = liquidity / vol_5m if vol_5m > 0 else 0
                             
@@ -263,7 +270,7 @@ async def scanner_loop(app: Application):
                                 
                                 buy_ratio = (buys_5m / total_txns) * 100 if total_txns > 0 else 0
                                 if buy_ratio >= 65:
-                                    projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio)
+                                    projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns)
                                     msg = (
                                         f"🟢 **TAKE POSITION (ENTRY SIGNAL)** 🟢\n"
                                         f"{ai_flag}"
@@ -273,7 +280,7 @@ async def scanner_loop(app: Application):
                                         f"**Liquidity:** `${liquidity:,.2f}`\n"
                                         f"**Buy Ratio:** `{buy_ratio:.1f}%` ({buys_5m} buys / {sells_5m} sells)\n"
                                         f"**5m Change:** `{price_change_5m:+.1f}%` (Healthy Entry Zone)\n\n"
-                                        f"📊 **HOLDING VALUE FORECAST ($100 Hold):**\n"
+                                        f"📊 **HOLDING VALUE & DURATION FORECAST:**\n"
                                         f"{projections}\n\n"
                                         f"📍 [View DEXScreener]({dex_url})\n"
                                         f"📋 `{token_addr}`"
@@ -286,7 +293,7 @@ async def scanner_loop(app: Application):
                                     )
                                     active_positions.add(pair_addr)
 
-                        # REFINED EXIT SIGNAL (Requires sustained sell pressure & transaction volume)
+                        # EXIT SIGNAL
                         elif pair_addr in active_positions:
                             sell_ratio = (sells_5m / total_txns) * 100 if total_txns > 0 else 0
                             if sell_ratio >= 75 and total_txns >= 10:
