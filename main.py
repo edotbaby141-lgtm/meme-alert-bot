@@ -47,7 +47,32 @@ def is_priority_token(symbol, name, description=""):
     text = f"{symbol} {name} {description}".lower()
     return any(keyword in text for keyword in TRENDING_AND_AI_KEYWORDS)
 
-def calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, test_amount=100):
+def fetch_crypto_news_catalysts(symbol, name):
+    """Fetches real-time crypto headlines and scans for market/token news spikes."""
+    try:
+        url = "https://cryptocurrency.cv/api/news?limit=15"
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            articles = res.json()
+            relevant_news = []
+            target = f"{symbol}".lower()
+            
+            for article in articles:
+                title = article.get('title', '')
+                if target in title.lower() or name.lower() in title.lower():
+                    relevant_news.append(f"• [{title}]({article.get('url', '#')})")
+            
+            if relevant_news:
+                return "📰 **TOKEN NEWS & CATALYSTS:**\n" + "\n".join(relevant_news[:2]) + "\n\n"
+            else:
+                # Return top macro headline if no token-specific news found
+                top_story = articles[0].get('title', '')
+                return f"📰 **MACRO MARKET HEADLINE:**\n• {top_story}\n\n"
+    except Exception as e:
+        logging.error(f"Error fetching news: {e}")
+    return ""
+
+def calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, mcap=0, vol_24h=0, price_change_24h=0, test_amount=100):
     v_l_ratio = vol_5m / liquidity if liquidity > 0 else 0
     
     # Target Multiplier
@@ -64,21 +89,27 @@ def calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, test_
     projected_value = test_amount * multiplier
     profit = projected_value - test_amount
 
-    # Dynamic Holding Time Logic
-    if v_l_ratio >= 1.5 or total_txns > 200:
-        holding_time = "⚡ **2 to 5 MINUTES** *(High Volatility Scalp — Take profits quickly!)*"
+    # EXTENDED MACRO TIME FRAME ENGINE (Days, Weeks, Months vs Minutes)
+    if liquidity >= 500000 and vol_24h >= 2000000 and mcap >= 10000000:
+        holding_time = "🗓️ **1 to 3 MONTHS** *(Established Liquidity Depth — Macro Hold / Swing)*"
+    elif liquidity >= 150000 and vol_24h >= 500000 and 0 <= price_change_24h <= 100:
+        holding_time = "📅 **1 to 4 WEEKS** *(Multi-Day Volume Consolidation — Healthy Swing Trend)*"
+    elif liquidity >= 80000 and vol_24h >= 200000:
+        holding_time = "📆 **2 to 7 DAYS** *(Short-Term Swing — Watch for local higher-lows)*"
+    elif v_l_ratio >= 1.5 or total_txns > 200:
+        holding_time = "⚡ **2 to 5 MINUTES** *(High Volatility Scalp — Fast profit lock required!)*"
     elif 0.5 <= v_l_ratio < 1.5 or (100 <= total_txns <= 200):
-        holding_time = "⏱️ **10 to 30 MINUTES** *(Standard Momentum Push — Watch sell volume)*"
+        holding_time = "⏱️ **10 to 30 MINUTES** *(Standard Momentum Push — Monitor sell pressure)*"
     elif liquidity >= 50000 and buy_ratio >= 60:
-        holding_time = "⏳ **1 to 4 HOURS** *(Stable Liquidity Pool — Can sustain a multi-hour trend)*"
+        holding_time = "⏳ **1 to 4 HOURS** *(Stable Pool — Can sustain intraday trend)*"
     else:
-        holding_time = "⏱️ **5 to 15 MINUTES** *(Micro-Cap Move — Lock profits on resistance)*"
+        holding_time = "⏱️ **5 to 15 MINUTES** *(Micro-Cap Scalp — High volume decay risk)*"
 
     return (
         f"{tier}\n"
         f"• **Initial Hold ($100):** `${test_amount:,.2f}`\n"
         f"• **Est. Value at Target:** `${projected_value:,.2f}` (`+${profit:,.2f}`)\n"
-        f"• **Estimated Hold Duration:** {holding_time}\n"
+        f"• **Recommended Hold Duration:** {holding_time}\n"
         f"• **Take Profit Targets:** 1.5x (`$150`) | 2x (`$200`) | 3x (`$300`)"
     )
 
@@ -115,13 +146,13 @@ def fetch_multi_source_addresses():
 
 # ================= INTERACTIVE MESSAGE HANDLER =================
 async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes pasted token contract addresses with clear Strong/Weak signals & holding duration."""
+    """Processes pasted token contract addresses with clear Strong/Weak signals, News & Holding Duration."""
     token_addr = update.message.text.strip()
     
     if token_addr.startswith("/"):
         return
 
-    await update.message.reply_text(f"🔎 **Analyzing Token Strength & Holding Window:**\n`{token_addr}`...", parse_mode="Markdown")
+    await update.message.reply_text(f"🔎 **Analyzing Token Metrics, News & Hold Time:**\n`{token_addr}`...", parse_mode="Markdown")
 
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}"
@@ -143,6 +174,9 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
             liquidity = pair.get('liquidity', {}).get('usd', 0)
             vol_5m = pair.get('volume', {}).get('m5', 0)
             vol_1h = pair.get('volume', {}).get('h1', 0)
+            vol_24h = pair.get('volume', {}).get('h24', 0)
+            mcap = pair.get('marketCap', 0) or pair.get('fdv', 0)
+            
             buys_5m = pair.get('txns', {}).get('m5', {}).get('buys', 0)
             sells_5m = pair.get('txns', {}).get('m5', {}).get('sells', 0)
             total_txns = buys_5m + sells_5m
@@ -150,6 +184,7 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
 
             price_change_5m = pair.get('priceChange', {}).get('m5', 0.0)
             price_change_1h = pair.get('priceChange', {}).get('h1', 0.0)
+            price_change_24h = pair.get('priceChange', {}).get('h24', 0.0)
 
             weakness_reasons = []
             strength_reasons = []
@@ -185,7 +220,8 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
                 action_signal = "⏳ **ACTION: WAIT FOR CONFIRMATION**\n*Reason: Mixed metrics. Added to background monitoring for a volume burst.*"
 
             custom_tracked_tokens.add(token_addr)
-            projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns)
+            projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, mcap, vol_24h, price_change_24h)
+            news_block = fetch_crypto_news_catalysts(symbol, name)
             ai_flag = "🤖 **AI / TRENDING TOKEN DETECTED** 🤖\n" if is_priority_token(symbol, name) else ""
 
             msg = (
@@ -195,6 +231,7 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
                 f"**Token:** `${symbol}` ({name})\n\n"
                 f"🏋️ **Strength Evaluation:** {strength_rating}\n"
                 f"🎯 {action_signal}\n\n"
+                f"{news_block}"
                 f"**Key Metrics:**\n"
                 f"• **Liquidity:** `${liquidity:,.2f}`\n"
                 f"• **5m Volume:** `${vol_5m:,.2f}`\n"
@@ -247,16 +284,20 @@ async def scanner_loop(app: Application):
                         
                         liquidity = pair.get('liquidity', {}).get('usd', 0)
                         vol_5m = pair.get('volume', {}).get('m5', 0)
+                        vol_24h = pair.get('volume', {}).get('h24', 0)
+                        mcap = pair.get('marketCap', 0) or pair.get('fdv', 0)
+                        
                         buys_5m = pair.get('txns', {}).get('m5', {}).get('buys', 0)
                         sells_5m = pair.get('txns', {}).get('m5', {}).get('sells', 0)
                         total_txns = buys_5m + sells_5m
 
                         price_change_5m = pair.get('priceChange', {}).get('m5', 0.0)
                         price_change_1h = pair.get('priceChange', {}).get('h1', 0.0)
+                        price_change_24h = pair.get('priceChange', {}).get('h24', 0.0)
 
                         ai_flag = "🤖 **AI / TRENDING TOKEN DETECTED** 🤖\n" if is_priority_token(symbol, name) else ""
 
-                        # ENTRY SIGNAL WITH DURATION ESTIMATE
+                        # ENTRY SIGNAL WITH EXTENDED DURATION & NEWS
                         if pair_addr not in active_positions:
                             liquidity_to_vol_ratio = liquidity / vol_5m if vol_5m > 0 else 0
                             
@@ -270,7 +311,8 @@ async def scanner_loop(app: Application):
                                 
                                 buy_ratio = (buys_5m / total_txns) * 100 if total_txns > 0 else 0
                                 if buy_ratio >= 65:
-                                    projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns)
+                                    projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, mcap, vol_24h, price_change_24h)
+                                    news_block = fetch_crypto_news_catalysts(symbol, name)
                                     msg = (
                                         f"🟢 **TAKE POSITION (ENTRY SIGNAL)** 🟢\n"
                                         f"{ai_flag}"
@@ -280,6 +322,7 @@ async def scanner_loop(app: Application):
                                         f"**Liquidity:** `${liquidity:,.2f}`\n"
                                         f"**Buy Ratio:** `{buy_ratio:.1f}%` ({buys_5m} buys / {sells_5m} sells)\n"
                                         f"**5m Change:** `{price_change_5m:+.1f}%` (Healthy Entry Zone)\n\n"
+                                        f"{news_block}"
                                         f"📊 **HOLDING VALUE & DURATION FORECAST:**\n"
                                         f"{projections}\n\n"
                                         f"📍 [View DEXScreener]({dex_url})\n"
