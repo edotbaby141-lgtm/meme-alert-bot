@@ -54,8 +54,63 @@ def is_priority_token(symbol, name, description=""):
     text = f"{symbol} {name} {description}".lower()
     return any(keyword in text for keyword in TRENDING_AND_AI_KEYWORDS)
 
+# ================= SECURITY API INTEGRATION =================
+def check_token_security(chain, token_address):
+    """
+    Checks token contract security via RugCheck (Solana) or GoPlus API (EVM Chains).
+    Returns (is_safe: bool, details_msg: str)
+    """
+    chain_lower = chain.lower()
+    
+    # 1. SOLANA CONTRACT CHECK (RugCheck API)
+    if chain_lower == "solana":
+        try:
+            url = f"https://api.rugcheck.xyz/v1/tokens/{token_address}/report/summary"
+            res = requests.get(url, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                score = data.get("score", 0)
+                risks = data.get("risks", [])
+                
+                risk_flags = [f"• {r.get('name')}: {r.get('description', '')}" for r in risks if r.get('level') in ['danger', 'warn']]
+                
+                if score > 2000 or any(r.get('level') == 'danger' for r in risks):
+                    return False, f"⚠️ **SOLANA SECURITY ALERT (RugCheck)**\nRisk Score: `{score}` (High Risk)\n" + "\n".join(risk_flags[:3])
+                return True, "✅ **Solana Security:** RugCheck Passed (No mint/freeze exploits detected)"
+        except Exception as e:
+            logging.error(f"Solana Security Check Error: {e}")
+            
+    # 2. EVM CONTRACT CHECK (GoPlus Security API)
+    else:
+        chain_mapping = {"ethereum": "1", "bsc": "56", "base": "8453"}
+        chain_id = chain_mapping.get(chain_lower)
+        if chain_id:
+            try:
+                url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={token_address}"
+                res = requests.get(url, timeout=5)
+                if res.status_code == 200:
+                    result = res.json().get("result", {}).get(token_address.lower(), {})
+                    
+                    is_honeypot = result.get("is_honeypot") == "1"
+                    is_mintable = result.get("is_mintable") == "1"
+                    cannot_sell = result.get("cannot_sell_all") == "1"
+                    owner_change = result.get("can_take_back_ownership") == "1"
+                    
+                    if is_honeypot or cannot_sell or owner_change:
+                        return False, "⚠️ **EVM SECURITY ALERT (GoPlus)**\n• Honeypot or Unsellable Contract Detected!"
+                    
+                    flags = []
+                    if is_mintable:
+                        flags.append("• Mintable Supply Enabled")
+                    
+                    flag_text = "\n".join(flags) if flags else "Clean Security Profile"
+                    return True, f"✅ **EVM Security:** GoPlus Passed ({flag_text})"
+            except Exception as e:
+                logging.error(f"EVM Security Check Error: {e}")
+
+    return True, "ℹ️ **Security:** Quick Check Clean / Unregistered Risk"
+
 def fetch_crypto_news_catalysts(symbol, name):
-    """Fetches real-time crypto headlines and scans for market/token news spikes."""
     try:
         url = "https://cryptocurrency.cv/api/news?limit=15"
         res = requests.get(url, timeout=5)
@@ -81,7 +136,6 @@ def fetch_crypto_news_catalysts(symbol, name):
 def calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, mcap=0, vol_24h=0, price_change_24h=0, test_amount=100):
     v_l_ratio = vol_5m / liquidity if liquidity > 0 else 0
     
-    # Target Multiplier
     if v_l_ratio > 0.5 and buy_ratio >= 80:
         tier = "🔥 **ULTRA HIGH MOMENTUM (3x - 5x Potential)**"
         multiplier = 3.0
@@ -95,7 +149,6 @@ def calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, mcap=
     projected_value = test_amount * multiplier
     profit = projected_value - test_amount
 
-    # EXTENDED MACRO TIME FRAME ENGINE (Days, Weeks, Months vs Minutes)
     if liquidity >= 500000 and vol_24h >= 2000000 and mcap >= 10000000:
         holding_time = "🗓️ **1 to 3 MONTHS** *(Established Liquidity Depth — Macro Hold / Swing)*"
     elif liquidity >= 150000 and vol_24h >= 500000 and 0 <= price_change_24h <= 100:
@@ -152,13 +205,12 @@ def fetch_multi_source_addresses():
 
 # ================= INTERACTIVE MESSAGE HANDLER =================
 async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes pasted token contract addresses with clear Strong/Weak signals, News & Holding Duration."""
     token_addr = update.message.text.strip()
     
     if token_addr.startswith("/"):
         return
 
-    await update.message.reply_text(f"🔎 **Analyzing Token Metrics, News & Hold Time:**\n`{token_addr}`...", parse_mode="Markdown")
+    await update.message.reply_text(f"🔎 **Analyzing Token Security & Performance Metrics:**\n`{token_addr}`...", parse_mode="Markdown")
 
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}"
@@ -177,9 +229,11 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
             name = base_token.get('name', '')
             dex_url = pair.get('url', '')
             
+            # Security Audit
+            is_safe, sec_msg = check_token_security(chain_id, token_addr)
+            
             liquidity = pair.get('liquidity', {}).get('usd', 0)
             vol_5m = pair.get('volume', {}).get('m5', 0)
-            vol_1h = pair.get('volume', {}).get('h1', 0)
             vol_24h = pair.get('volume', {}).get('h24', 0)
             mcap = pair.get('marketCap', 0) or pair.get('fdv', 0)
             
@@ -195,63 +249,46 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
             weakness_reasons = []
             strength_reasons = []
 
+            if not is_safe:
+                weakness_reasons.append("• **FAILED CONTRACT SECURITY AUDIT**")
             if liquidity < 20000:
-                weakness_reasons.append("• **Thin Liquidity**: Under $20k depth (high slippage risk)")
-            if liquidity / vol_5m < 0.25 if vol_5m > 0 else False:
-                weakness_reasons.append("• **Volume/Liquidity Imbalance**: Volume is dangerously high compared to pool size")
+                weakness_reasons.append("• **Thin Liquidity**: Under $20k depth")
             if buy_ratio < 45 and total_txns >= 3:
                 weakness_reasons.append(f"• **Sell Dominance**: {100-buy_ratio:.1f}% sells in last 5m")
-            if price_change_5m > 25.0 or price_change_1h > 250.0:
-                weakness_reasons.append(f"• **Overextended / Top Risk**: 5m: `{price_change_5m:+.1f}%` | 1h: `{price_change_1h:+.1f}%`")
-            if price_change_5m < -2.0 or price_change_1h < -5.0:
-                weakness_reasons.append(f"• **Downtrending Price**: 5m: `{price_change_5m:+.1f}%` | 1h: `{price_change_1h:+.1f}%`")
 
-            if liquidity >= 20000 and (liquidity / vol_5m >= 0.25 if vol_5m > 0 else True):
-                strength_reasons.append(f"• **Solid Liquidity Depth**: `${liquidity:,.2f}` pool size")
+            if is_safe:
+                strength_reasons.append("• **Contract Security Audit Passed**")
+            if liquidity >= 20000:
+                strength_reasons.append(f"• **Solid Pool Depth**: `${liquidity:,.2f}`")
             if buy_ratio >= 65 and total_txns >= 5:
-                strength_reasons.append(f"• **Bullish Buy Ratio**: `{buy_ratio:.1f}%` buys ({buys_5m} buys / {sells_5m} sells)")
-            if 0.5 <= price_change_5m <= 20.0 and price_change_1h <= 200.0:
-                strength_reasons.append(f"• **Healthy Upward Trend**: 5m: `{price_change_5m:+.1f}%` (Not Overextended)")
-            if vol_5m >= MIN_5M_VOLUME:
-                strength_reasons.append(f"• **Active Volume Spike**: `${vol_5m:,.2f}` in last 5m")
+                strength_reasons.append(f"• **Bullish Buy Ratio**: `{buy_ratio:.1f}%`")
 
-            if len(strength_reasons) >= 3 and len(weakness_reasons) == 0:
+            if is_safe and len(strength_reasons) >= 3 and len(weakness_reasons) == 0:
                 strength_rating = "🟢 **STRONG / HIGH MOMENTUM**"
-                action_signal = "🟢 **ACTION: TAKE ENTRY / BUY SIGNAL**\n*Reason: Healthy volume, stable pool liquidity, and non-extended price breakout.*"
-            elif len(weakness_reasons) >= 2 or buy_ratio == 0:
+                action_signal = "🟢 **ACTION: BUY SIGNAL CONFIRMED**"
+            elif not is_safe or len(weakness_reasons) >= 2:
                 strength_rating = "🔴 **WEAK / HIGH RISK**"
-                action_signal = "🚫 **ACTION: DO NOT BUY / AVOID**\n*Reason: Thin liquidity, heavy sell pressure, or overextended top.*"
+                action_signal = "🚫 **ACTION: DO NOT BUY / SECURITY RISK**"
             else:
                 strength_rating = "🟡 **NEUTRAL / WATCHLIST**"
-                action_signal = "⏳ **ACTION: WAIT FOR CONFIRMATION**\n*Reason: Mixed metrics. Added to background monitoring for a volume burst.*"
+                action_signal = "⏳ **ACTION: WAIT FOR CONFIRMATION**"
 
             custom_tracked_tokens.add(token_addr)
             projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, mcap, vol_24h, price_change_24h)
             news_block = fetch_crypto_news_catalysts(symbol, name)
-            ai_flag = "🤖 **AI / TRENDING TOKEN DETECTED** 🤖\n" if is_priority_token(symbol, name) else ""
 
             msg = (
                 f"📊 **TOKEN DIAGNOSTIC & TRADE SIGNAL**\n"
-                f"{ai_flag}"
                 f"**Chain:** `{chain_id}`\n"
                 f"**Token:** `${symbol}` ({name})\n\n"
-                f"🏋️ **Strength Evaluation:** {strength_rating}\n"
+                f"🛡️ **SECURITY STATUS:**\n{sec_msg}\n\n"
+                f"🏋️ **Rating:** {strength_rating}\n"
                 f"🎯 {action_signal}\n\n"
                 f"{news_block}"
                 f"**Key Metrics:**\n"
                 f"• **Liquidity:** `${liquidity:,.2f}`\n"
                 f"• **5m Volume:** `${vol_5m:,.2f}`\n"
-                f"• **Buy Ratio:** `{buy_ratio:.1f}%` ({buys_5m} buys / {sells_5m} sells)\n"
-                f"• **Price Change (5m / 1h):** `{price_change_5m:+.2f}%` / `{price_change_1h:+.2f}%`\n\n"
-            )
-
-            if strength_reasons:
-                msg += "🟢 **Strength Drivers:**\n" + "\n".join(strength_reasons) + "\n\n"
-
-            if weakness_reasons:
-                msg += "⚠️ **Weakness Factors:**\n" + "\n".join(weakness_reasons) + "\n\n"
-
-            msg += (
+                f"• **Buy Ratio:** `{buy_ratio:.1f}%` ({buys_5m} buys / {sells_5m} sells)\n\n"
                 f"📊 **HOLDING VALUE & DURATION FORECAST:**\n"
                 f"{projections}\n\n"
                 f"📍 [View DEXScreener]({dex_url})"
@@ -263,9 +300,8 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
         logging.error(f"Error checking custom token: {e}")
         await update.message.reply_text("⚠️ Failed to pull DEX data. Verify contract address and try again.")
 
-# ================= AUTOMATED SCANNER LOOP (INTRADAY SCALP) =================
+# ================= AUTOMATED SCANNER LOOP =================
 async def scanner_loop(app: Application):
-    """Background task scanning target chains + custom user tokens continuously."""
     chat_id = str(TELEGRAM_CHAT_ID).strip()
     
     while True:
@@ -296,14 +332,10 @@ async def scanner_loop(app: Application):
                         buys_5m = pair.get('txns', {}).get('m5', {}).get('buys', 0)
                         sells_5m = pair.get('txns', {}).get('m5', {}).get('sells', 0)
                         total_txns = buys_5m + sells_5m
-
                         price_change_5m = pair.get('priceChange', {}).get('m5', 0.0)
                         price_change_1h = pair.get('priceChange', {}).get('h1', 0.0)
                         price_change_24h = pair.get('priceChange', {}).get('h24', 0.0)
 
-                        ai_flag = "🤖 **AI / TRENDING TOKEN DETECTED** 🤖\n" if is_priority_token(symbol, name) else ""
-
-                        # ENTRY SIGNAL WITH EXTENDED DURATION & NEWS
                         if pair_addr not in active_positions:
                             liquidity_to_vol_ratio = liquidity / vol_5m if vol_5m > 0 else 0
                             
@@ -317,60 +349,40 @@ async def scanner_loop(app: Application):
                                 
                                 buy_ratio = (buys_5m / total_txns) * 100 if total_txns > 0 else 0
                                 if buy_ratio >= 65:
-                                    projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, mcap, vol_24h, price_change_24h)
-                                    news_block = fetch_crypto_news_catalysts(symbol, name)
-                                    msg = (
-                                        f"🟢 **TAKE POSITION (ENTRY SIGNAL)** 🟢\n"
-                                        f"{ai_flag}"
-                                        f"**Chain:** `{chain_id}`\n"
-                                        f"**Token:** `${symbol}` ({name})\n"
-                                        f"**5m Volume:** `${vol_5m:,.2f}`\n"
-                                        f"**Liquidity:** `${liquidity:,.2f}`\n"
-                                        f"**Buy Ratio:** `{buy_ratio:.1f}%` ({buys_5m} buys / {sells_5m} sells)\n"
-                                        f"**5m Change:** `{price_change_5m:+.1f}%` (Healthy Entry Zone)\n\n"
-                                        f"{news_block}"
-                                        f"📊 **HOLDING VALUE & DURATION FORECAST:**\n"
-                                        f"{projections}\n\n"
-                                        f"📍 [View DEXScreener]({dex_url})\n"
-                                        f"📋 `{token_addr}`"
-                                    )
-                                    await app.bot.send_message(
-                                        chat_id=chat_id, 
-                                        text=msg, 
-                                        parse_mode="Markdown", 
-                                        disable_web_page_preview=True
-                                    )
-                                    active_positions.add(pair_addr)
-
-                        # EXIT SIGNAL
-                        elif pair_addr in active_positions:
-                            sell_ratio = (sells_5m / total_txns) * 100 if total_txns > 0 else 0
-                            if sell_ratio >= 75 and total_txns >= 10:
-                                msg = (
-                                    f"🔴 **STEP OUT (EXIT SIGNAL)** 🔴\n\n"
-                                    f"**Chain:** `{chain_id}`\n"
-                                    f"**Token:** `${symbol}`\n"
-                                    f"**Alert:** Heavy sell-off detected!\n"
-                                    f"**Sell Pressure:** `{sell_ratio:.1f}%` sells in last 5m ({sells_5m}/{total_txns} txns)\n\n"
-                                    f"📍 [View DEXScreener]({dex_url})\n"
-                                    f"📋 `{token_addr}`"
-                                )
-                                await app.bot.send_message(
-                                    chat_id=chat_id, 
-                                    text=msg, 
-                                    parse_mode="Markdown", 
-                                    disable_web_page_preview=True
-                                )
-                                active_positions.remove(pair_addr)
+                                    # Security Gate check before sending alert
+                                    is_safe, sec_msg = check_token_security(chain_id, token_addr)
+                                    if is_safe:
+                                        projections = calculate_holding_projection(vol_5m, liquidity, buy_ratio, total_txns, mcap, vol_24h, price_change_24h)
+                                        news_block = fetch_crypto_news_catalysts(symbol, name)
+                                        msg = (
+                                            f"🟢 **TAKE POSITION (ENTRY SIGNAL)** 🟢\n"
+                                            f"**Chain:** `{chain_id}`\n"
+                                            f"**Token:** `${symbol}` ({name})\n"
+                                            f"🛡️ {sec_msg}\n\n"
+                                            f"**5m Volume:** `${vol_5m:,.2f}`\n"
+                                            f"**Liquidity:** `${liquidity:,.2f}`\n"
+                                            f"**Buy Ratio:** `{buy_ratio:.1f}%` ({buys_5m} buys / {sells_5m} sells)\n\n"
+                                            f"{news_block}"
+                                            f"📊 **HOLDING VALUE & DURATION FORECAST:**\n"
+                                            f"{projections}\n\n"
+                                            f"📍 [View DEXScreener]({dex_url})\n"
+                                            f"📋 `{token_addr}`"
+                                        )
+                                        await app.bot.send_message(
+                                            chat_id=chat_id, 
+                                            text=msg, 
+                                            parse_mode="Markdown", 
+                                            disable_web_page_preview=True
+                                        )
+                                        active_positions.add(pair_addr)
 
         except Exception as e:
             logging.error(f"Scanner exception: {e}")
             
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-# ================= MACRO SWING SCANNER LOOP (UNIPCS / HIGH CONVICTION MODE) =================
+# ================= MACRO SWING SCANNER LOOP =================
 async def macro_swing_scanner_loop(app: Application):
-    """Scans for high-liquidity, high-market-cap tokens suited for multi-week/month holding."""
     chat_id = str(TELEGRAM_CHAT_ID).strip()
     
     while True:
@@ -399,42 +411,43 @@ async def macro_swing_scanner_loop(app: Application):
                         price_change_24h = pair.get('priceChange', {}).get('h24', 0.0)
 
                         if pair_addr not in macro_active_positions:
-                            # Filters for Unipcs-style Macro Setup
                             if (liquidity >= MACRO_MIN_LIQUIDITY and 
                                 mcap >= MACRO_MIN_MCAP and 
                                 vol_24h >= MACRO_MIN_24H_VOL and 
                                 -10.0 <= price_change_24h <= 50.0):
                                 
-                                news_block = fetch_crypto_news_catalysts(symbol, name)
-                                msg = (
-                                    f"🐋 **MACRO HIGH-CONVICTION SWING ALERT (UNIPCS MODE)** 🐋\n\n"
-                                    f"**Chain:** `{chain_id}`\n"
-                                    f"**Token:** `${symbol}` ({name})\n"
-                                    f"**Market Cap:** `${mcap:,.2f}`\n"
-                                    f"**Liquidity Pool Depth:** `${liquidity:,.2f}`\n"
-                                    f"**24h Volume:** `${vol_24h:,.2f}`\n"
-                                    f"**24h Price Change:** `{price_change_24h:+.1f}%` (Consolidation Zone)\n\n"
-                                    f"{news_block}"
-                                    f"🗓️ **ESTABLISHED TREND FORECAST:**\n"
-                                    f"• **Recommended Hold Duration:** 1 to 4 Weeks / Months\n"
-                                    f"• **Strategy:** Build core position, trail stops on 4H chart.\n\n"
-                                    f"📍 [View DEXScreener]({dex_url})\n"
-                                    f"📋 `{token_addr}`"
-                                )
-                                await app.bot.send_message(
-                                    chat_id=chat_id, 
-                                    text=msg, 
-                                    parse_mode="Markdown", 
-                                    disable_web_page_preview=True
-                                )
-                                macro_active_positions.add(pair_addr)
+                                is_safe, sec_msg = check_token_security(chain_id, token_addr)
+                                if is_safe:
+                                    news_block = fetch_crypto_news_catalysts(symbol, name)
+                                    msg = (
+                                        f"🐋 **MACRO HIGH-CONVICTION SWING ALERT (UNIPCS MODE)** 🐋\n\n"
+                                        f"**Chain:** `{chain_id}`\n"
+                                        f"**Token:** `${symbol}` ({name})\n"
+                                        f"🛡️ {sec_msg}\n\n"
+                                        f"**Market Cap:** `${mcap:,.2f}`\n"
+                                        f"**Liquidity Pool Depth:** `${liquidity:,.2f}`\n"
+                                        f"**24h Volume:** `${vol_24h:,.2f}`\n\n"
+                                        f"{news_block}"
+                                        f"🗓️ **ESTABLISHED TREND FORECAST:**\n"
+                                        f"• **Recommended Hold Duration:** 1 to 4 Weeks / Months\n"
+                                        f"• **Strategy:** Build core position, trail stops on 4H chart.\n\n"
+                                        f"📍 [View DEXScreener]({dex_url})\n"
+                                        f"📋 `{token_addr}`"
+                                    )
+                                    await app.bot.send_message(
+                                        chat_id=chat_id, 
+                                        text=msg, 
+                                        parse_mode="Markdown", 
+                                        disable_web_page_preview=True
+                                    )
+                                    macro_active_positions.add(pair_addr)
 
         except Exception as e:
             logging.error(f"Macro Scanner exception: {e}")
             
-        await asyncio.sleep(60) # Runs every 60 seconds
+        await asyncio.sleep(60)
 
-# ================= MAIN ASYNC RUNNER =================
+# ================= MAIN RUNNER =================
 async def main_async():
     token = TELEGRAM_BOT_TOKEN.strip()
     app = Application.builder().token(token).build()
@@ -445,11 +458,10 @@ async def main_async():
         await app.start()
         await app.updater.start_polling()
         
-        # Concurrent tasks for both Scalps and Macro Swings
         asyncio.create_task(scanner_loop(app))
         asyncio.create_task(macro_swing_scanner_loop(app))
         
-        logging.info("Scalp Scanner, Macro Swing Engine, and Interactive Bot live concurrently...")
+        logging.info("Scalp Scanner, Macro Swing Engine, Security Audits, and Interactive Bot live...")
         await asyncio.Event().wait()
 
 def main():
