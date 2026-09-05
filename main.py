@@ -14,10 +14,16 @@ TELEGRAM_CHAT_ID = "5642314005"
 TARGET_CHAINS = {"solana", "base", "ethereum", "bsc", "robinhood"}
 CHECK_INTERVAL_SECONDS = 30
 
+# Fast Scalp Thresholds
 MIN_LIQUIDITY_USD = 20000
 MAX_LIQUIDITY_USD = 1000000
 MIN_5M_VOLUME = 5000
 MIN_BUYS_5M = 15
+
+# Macro / High-Conviction "Unipcs" Swing Thresholds
+MACRO_MIN_LIQUIDITY = 250000
+MACRO_MIN_MCAP = 5000000
+MACRO_MIN_24H_VOL = 1000000
 
 TRENDING_AND_AI_KEYWORDS = [
     "ai", "gpt", "agent", "neural", "intel", "mind", "bot", "claude", "solana-ai", "terminal",
@@ -28,6 +34,7 @@ TRENDING_AND_AI_KEYWORDS = [
 # =================================================
 
 active_positions = set()
+macro_active_positions = set()
 custom_tracked_tokens = set()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -65,7 +72,6 @@ def fetch_crypto_news_catalysts(symbol, name):
             if relevant_news:
                 return "📰 **TOKEN NEWS & CATALYSTS:**\n" + "\n".join(relevant_news[:2]) + "\n\n"
             else:
-                # Return top macro headline if no token-specific news found
                 top_story = articles[0].get('title', '')
                 return f"📰 **MACRO MARKET HEADLINE:**\n• {top_story}\n\n"
     except Exception as e:
@@ -257,7 +263,7 @@ async def analyze_custom_address(update: Update, context: ContextTypes.DEFAULT_T
         logging.error(f"Error checking custom token: {e}")
         await update.message.reply_text("⚠️ Failed to pull DEX data. Verify contract address and try again.")
 
-# ================= AUTOMATED SCANNER LOOP =================
+# ================= AUTOMATED SCANNER LOOP (INTRADAY SCALP) =================
 async def scanner_loop(app: Application):
     """Background task scanning target chains + custom user tokens continuously."""
     chat_id = str(TELEGRAM_CHAT_ID).strip()
@@ -362,6 +368,72 @@ async def scanner_loop(app: Application):
             
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
+# ================= MACRO SWING SCANNER LOOP (UNIPCS / HIGH CONVICTION MODE) =================
+async def macro_swing_scanner_loop(app: Application):
+    """Scans for high-liquidity, high-market-cap tokens suited for multi-week/month holding."""
+    chat_id = str(TELEGRAM_CHAT_ID).strip()
+    
+    while True:
+        try:
+            addresses = fetch_multi_source_addresses()
+            if addresses:
+                batch = addresses[:30]
+                pairs_url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(batch)}"
+                pairs_res = requests.get(pairs_url, timeout=10)
+                
+                if pairs_res.status_code == 200:
+                    pairs = pairs_res.json().get('pairs', [])
+                    
+                    for pair in pairs:
+                        pair_addr = pair.get('pairAddress')
+                        chain_id = pair.get('chainId', 'unknown').upper()
+                        base_token = pair.get('baseToken', {})
+                        symbol = base_token.get('symbol', 'UNKNOWN')
+                        name = base_token.get('name', '')
+                        dex_url = pair.get('url', '')
+                        token_addr = base_token.get('address', '')
+                        
+                        liquidity = pair.get('liquidity', {}).get('usd', 0)
+                        vol_24h = pair.get('volume', {}).get('h24', 0)
+                        mcap = pair.get('marketCap', 0) or pair.get('fdv', 0)
+                        price_change_24h = pair.get('priceChange', {}).get('h24', 0.0)
+
+                        if pair_addr not in macro_active_positions:
+                            # Filters for Unipcs-style Macro Setup
+                            if (liquidity >= MACRO_MIN_LIQUIDITY and 
+                                mcap >= MACRO_MIN_MCAP and 
+                                vol_24h >= MACRO_MIN_24H_VOL and 
+                                -10.0 <= price_change_24h <= 50.0):
+                                
+                                news_block = fetch_crypto_news_catalysts(symbol, name)
+                                msg = (
+                                    f"🐋 **MACRO HIGH-CONVICTION SWING ALERT (UNIPCS MODE)** 🐋\n\n"
+                                    f"**Chain:** `{chain_id}`\n"
+                                    f"**Token:** `${symbol}` ({name})\n"
+                                    f"**Market Cap:** `${mcap:,.2f}`\n"
+                                    f"**Liquidity Pool Depth:** `${liquidity:,.2f}`\n"
+                                    f"**24h Volume:** `${vol_24h:,.2f}`\n"
+                                    f"**24h Price Change:** `{price_change_24h:+.1f}%` (Consolidation Zone)\n\n"
+                                    f"{news_block}"
+                                    f"🗓️ **ESTABLISHED TREND FORECAST:**\n"
+                                    f"• **Recommended Hold Duration:** 1 to 4 Weeks / Months\n"
+                                    f"• **Strategy:** Build core position, trail stops on 4H chart.\n\n"
+                                    f"📍 [View DEXScreener]({dex_url})\n"
+                                    f"📋 `{token_addr}`"
+                                )
+                                await app.bot.send_message(
+                                    chat_id=chat_id, 
+                                    text=msg, 
+                                    parse_mode="Markdown", 
+                                    disable_web_page_preview=True
+                                )
+                                macro_active_positions.add(pair_addr)
+
+        except Exception as e:
+            logging.error(f"Macro Scanner exception: {e}")
+            
+        await asyncio.sleep(60) # Runs every 60 seconds
+
 # ================= MAIN ASYNC RUNNER =================
 async def main_async():
     token = TELEGRAM_BOT_TOKEN.strip()
@@ -373,9 +445,11 @@ async def main_async():
         await app.start()
         await app.updater.start_polling()
         
+        # Concurrent tasks for both Scalps and Macro Swings
         asyncio.create_task(scanner_loop(app))
+        asyncio.create_task(macro_swing_scanner_loop(app))
         
-        logging.info("Multi-chain Scanner and Interactive Bot live concurrently...")
+        logging.info("Scalp Scanner, Macro Swing Engine, and Interactive Bot live concurrently...")
         await asyncio.Event().wait()
 
 def main():
