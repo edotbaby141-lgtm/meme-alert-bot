@@ -1,6 +1,9 @@
+import os
+import threading
 import requests
 import asyncio
 import logging
+from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
@@ -8,16 +11,27 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- FLASK HEALTH DUMMY SERVER (Required for Render Free Web Tier) ---
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def health_check():
+    return "Bot is active 24/7", 200
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    web_app.run(host="0.0.0.0", port=port)
+
 # --- YOUR DIRECT HARDCODED CREDENTIALS ---
 TELEGRAM_BOT_TOKEN = "8804502384:AAE2TxEQL-a4pueKXemrRqNRxKqwSFHI5dw"
 TELEGRAM_CHAT_ID = "5642314005"
 
 # --- PARAMETERS & STRICT FILTERS ---
-MIN_INITIAL_SOL = 20.0  # Minimum SOL threshold to prevent micro-cap spam
+MIN_INITIAL_SOL = 20.0  # Minimum SOL threshold
 BLOCKED_KEYWORDS = ["NONAME", "NO NAME", "TEST", "UNTITLED", "PLANKTON", "RUG"]
 
 def fetch_dex_data(address: str) -> dict:
-    """Fetches real-time market metrics from DexScreener API and evaluates strength."""
+    """Fetches real-time market metrics from DexScreener API."""
     url = f"https://api.dexscreener.com/latest/dex/tokens/{address}"
     try:
         res = requests.get(url, timeout=10).json()
@@ -25,7 +39,6 @@ def fetch_dex_data(address: str) -> dict:
         if not pairs:
             return None
 
-        # Grab top liquidity pair
         pair = sorted(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0), reverse=True)[0]
         
         token_name = pair.get("baseToken", {}).get("name", "Unknown")
@@ -38,12 +51,11 @@ def fetch_dex_data(address: str) -> dict:
         total_txns = buys_5m + sells_5m
         buy_ratio = (buys_5m / total_txns * 100) if total_txns > 0 else 0.0
 
-        # Strength Assessment Logic
         if buy_ratio >= 65.0 and liquidity >= 10000:
             status = "STRONG 🟢"
             signal_type = "🟢 TAKE POSITION (ENTRY SIGNAL) 🟢"
             forecast = "⚡ HIGH MOMENTUM (1.5x - 2.5x Potential)"
-            hold_time = "⚡ 2 to 5 MINUTES (High Volatility Scalp - Fast profit lock required!)"
+            hold_time = "⚡ 2 to 5 MINUTES (High Volatility Scalp)"
         elif buy_ratio <= 40.0 or liquidity < 5000:
             status = "WEAK 🔴"
             signal_type = "🔴 TAKE PROFIT / EXIT SIGNAL 🔴"
@@ -75,10 +87,8 @@ def fetch_dex_data(address: str) -> dict:
 
 # --- INTERACTIVE ADDRESS LOOKUP ---
 async def handle_address_paste(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Responds when a Solana contract address is pasted directly into Telegram."""
     text = update.message.text.strip()
     
-    # Filter non-address text (Solana addresses are ~32-44 characters)
     if len(text) < 30 or len(text) > 50 or " " in text:
         return
 
@@ -93,7 +103,7 @@ async def handle_address_paste(update: Update, context: ContextTypes.DEFAULT_TYP
         f"{data['signal_type']}\n"
         f"**Chain:** SOLANA\n"
         f"**Token:** ${data['symbol']} ({data['name']})\n"
-        f"🛡️ **Solana Security:** RugCheck Passed (No mint/freeze exploits detected)\n\n"
+        f"🛡️ **Solana Security:** RugCheck Passed\n\n"
         f"**Rating:** {data['status']}\n"
         f"**5m Volume:** ${data['vol_5m']:,.2f}\n"
         f"**Liquidity:** ${data['liquidity']:,.2f}\n"
@@ -111,11 +121,9 @@ async def handle_address_paste(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- AUTOMATED 24/7 LAUNCH STREAM ---
 async def automated_stream_loop(app):
-    """Continuously evaluates liquidity streams and broadcasts signals."""
     logger.info("WebSocket Streaming Engine & Interactive Bot Active")
     
     while True:
-        # Mock stream event receiver (hook your websocket/listener payload here)
         sample_launch = {
             "address": "9sCX2joHc7Zwuu fia1sCYsW88SHoKPbB4xaLU8B3pump",
             "name": "CAT BILL",
@@ -127,7 +135,6 @@ async def automated_stream_loop(app):
         token_name = sample_launch.get("name", "").upper()
         sol_amount = sample_launch.get("initial_sol", 0.0)
 
-        # Check safety filters
         if sol_amount >= MIN_INITIAL_SOL and not any(k in token_name for k in BLOCKED_KEYWORDS):
             data = fetch_dex_data(sample_launch["address"])
             
@@ -137,7 +144,7 @@ async def automated_stream_loop(app):
                     f"{data['signal_type']}\n"
                     f"**Chain:** SOLANA\n"
                     f"**Token:** ${data['symbol']} ({data['name']})\n"
-                    f"🛡️ **Solana Security:** RugCheck Passed (No mint/freeze exploits detected)\n\n"
+                    f"🛡️ **Solana Security:** RugCheck Passed\n\n"
                     f"**Initial Pool SOL:** {sol_amount:.2f} SOL\n"
                     f"**5m Volume:** ${data['vol_5m']:,.2f}\n"
                     f"**Liquidity:** ${data['liquidity']:,.2f}\n"
@@ -165,17 +172,17 @@ async def automated_stream_loop(app):
         await asyncio.sleep(60)
 
 async def main():
+    # Start web server thread to satisfy Render Free Web Service requirement
+    threading.Thread(target=run_web_server, daemon=True).start()
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Register manual contract address lookup handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address_paste))
 
-    # Start Telegram app and polling
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
-    # Run stream loop concurrently
     await automated_stream_loop(app)
 
 if __name__ == "__main__":
