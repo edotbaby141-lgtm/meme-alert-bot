@@ -1,4 +1,3 @@
-import os
 import requests
 import asyncio
 import logging
@@ -9,9 +8,9 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Environment Variables
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# --- YOUR DIRECT HARDCODED CREDENTIALS ---
+TELEGRAM_BOT_TOKEN = "8804502384:AAEX_2FuTb4PAmT7rVk_T7Qpq695T5JExKw"
+TELEGRAM_CHAT_ID = "5642314005"
 
 # --- PARAMETERS & STRICT FILTERS ---
 MIN_INITIAL_SOL = 20.0  # Minimum SOL threshold to prevent micro-cap spam
@@ -166,10 +165,6 @@ async def automated_stream_loop(app):
         await asyncio.sleep(60)
 
 async def main():
-    if not TELEGRAM_BOT_TOKEN:
-        print("Missing TELEGRAM_BOT_TOKEN environment variable!")
-        return
-
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Register manual contract address lookup handler
