@@ -26,9 +26,8 @@ def run_web_server():
 TELEGRAM_BOT_TOKEN = "8804502384:AAHYjDaiM_sj7p3t1MRCSKJA5XMoUmqWINo"
 TELEGRAM_CHAT_ID = "5642314005"
 
-# --- PARAMETERS & STRICT FILTERS ---
-MIN_INITIAL_SOL = 20.0
-BLOCKED_KEYWORDS = ["NONAME", "NO NAME", "TEST", "UNTITLED", "PLANKTON", "RUG"]
+# Keep track of already alerted token addresses so we don't spam duplicate alerts
+seen_tokens = set()
 
 def fetch_dex_data(address: str) -> dict:
     """Fetches real-time market metrics from DexScreener API."""
@@ -54,17 +53,17 @@ def fetch_dex_data(address: str) -> dict:
 
         if buy_ratio >= 65.0 and liquidity >= 10000:
             status = "STRONG 🟢"
-            signal_type = "🟢 TAKE POSITION (ENTRY SIGNAL) 🟢"
+            signal_type = "🟢 EARLY MOMENTUM POTENTIAL 🟢"
             forecast = "⚡ HIGH MOMENTUM (1.5x - 2.5x Potential)"
             hold_time = "⚡ 2 to 5 MINUTES (High Volatility Scalp)"
         elif buy_ratio <= 40.0 or liquidity < 5000:
-            status = "WEAK 🔴"
-            signal_type = "🔴 TAKE PROFIT / EXIT SIGNAL 🔴"
+            status = "WEAK / HIGH RISK 🔴"
+            signal_type = "🔴 UNTESTED / LOW LIQUIDITY 🔴"
             forecast = "📉 LOW MOMENTUM / HIGH RUG RISK"
             hold_time = "N/A — High Risk Avoid/Exit"
         else:
             status = "NEUTRAL 🟡"
-            signal_type = "🟡 NEUTRAL SIGNAL 🟡"
+            signal_type = "🟡 EARLY SPECULATIVE ENTRY 🟡"
             forecast = "📊 MODERATE VOLATILITY"
             hold_time = "5 to 10 MINUTES"
 
@@ -120,44 +119,53 @@ async def handle_address_paste(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
 
-# --- AUTOMATED 24/7 LAUNCH STREAM ---
+# --- AUTOMATED 24/7 EARLY-LISTING STREAM ---
 async def automated_stream_loop(app):
-    logger.info("Streaming Engine Active")
+    logger.info("Streaming Engine Active: Monitoring Brand-New Token Listings")
     
     while True:
         try:
-            # Polls DexScreener for newly boosted/trending tokens across DEXs
-            res = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=10).json()
+            # Polls DexScreener for newly created token profiles
+            res = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=10).json()
+            
             if isinstance(res, list) and len(res) > 0:
-                top_token = res[0]
-                address = top_token.get("tokenAddress")
-                if address:
-                    data = fetch_dex_data(address)
-                    if data and TELEGRAM_CHAT_ID:
-                        msg = (
-                            f"⚡ **LIVE TRENDING LAUNCH ALERT** ⚡\n"
-                            f"{data['signal_type']}\n"
-                            f"**Chain:** {data['chain']}\n"
-                            f"**Token:** ${data['symbol']} ({data['name']})\n\n"
-                            f"**5m Volume:** ${data['vol_5m']:,.2f}\n"
-                            f"**Liquidity:** ${data['liquidity']:,.2f}\n"
-                            f"**Buy Ratio:** {data['buy_ratio']:.1f}% ({data['buys']} buys / {data['sells']} sells)\n\n"
-                            f"📊 **FORECAST:**\n"
-                            f"{data['forecast']}\n"
-                            f"• **Recommended Duration:** {data['hold_time']}\n\n"
-                            f"📋 **Contract Address:**\n`{address}`\n\n"
-                            f"📍 [View DEXScreener]({data['dex_url']})"
-                        )
-                        await app.bot.send_message(
-                            chat_id=TELEGRAM_CHAT_ID,
-                            text=msg,
-                            parse_mode="Markdown",
-                            disable_web_page_preview=True
-                        )
+                for item in res[:5]:  # Process top 5 newest listings
+                    address = item.get("tokenAddress")
+                    
+                    if address and address not in seen_tokens:
+                        seen_tokens.add(address)
+                        data = fetch_dex_data(address)
+                        
+                        if data and TELEGRAM_CHAT_ID:
+                            msg = (
+                                f"🚨 **NEW EARLY TOKEN LISTING ALERT** 🚨\n"
+                                f"{data['signal_type']}\n"
+                                f"**Chain:** {data['chain']}\n"
+                                f"**Token:** ${data['symbol']} ({data['name']})\n\n"
+                                f"**5m Volume:** ${data['vol_5m']:,.2f}\n"
+                                f"**Liquidity:** ${data['liquidity']:,.2f}\n"
+                                f"**Buy Ratio:** {data['buy_ratio']:.1f}% ({data['buys']} buys / {data['sells']} sells)\n\n"
+                                f"📊 **EARLY FORECAST:**\n"
+                                f"{data['forecast']}\n"
+                                f"• **Recommended Duration:** {data['hold_time']}\n\n"
+                                f"📋 **Contract Address:**\n`{address}`\n\n"
+                                f"📍 [View DEXScreener]({data['dex_url']})"
+                            )
+                            await app.bot.send_message(
+                                chat_id=TELEGRAM_CHAT_ID,
+                                text=msg,
+                                parse_mode="Markdown",
+                                disable_web_page_preview=True
+                            )
+                            
+                        # Limit memory footprint of tracking set
+                        if len(seen_tokens) > 500:
+                            seen_tokens.clear()
+                            
         except Exception as e:
-            logger.error(f"Error in stream loop: {e}")
+            logger.error(f"Error in early listing stream loop: {e}")
 
-        await asyncio.sleep(120)
+        await asyncio.sleep(60)  # Checks for new profiles every 60 seconds
 
 async def main():
     threading.Thread(target=run_web_server, daemon=True).start()
