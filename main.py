@@ -11,7 +11,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- FLASK HEALTH DUMMY SERVER (Required for Render Free Web Tier) ---
+# --- FLASK HEALTH DUMMY SERVER ---
 web_app = Flask(__name__)
 
 @web_app.route('/')
@@ -27,7 +27,7 @@ TELEGRAM_BOT_TOKEN = "8804502384:AAHYjDaiM_sj7p3t1MRCSKJA5XMoUmqWINo"
 TELEGRAM_CHAT_ID = "5642314005"
 
 # --- PARAMETERS & STRICT FILTERS ---
-MIN_INITIAL_SOL = 20.0  # Minimum SOL threshold
+MIN_INITIAL_SOL = 20.0
 BLOCKED_KEYWORDS = ["NONAME", "NO NAME", "TEST", "UNTITLED", "PLANKTON", "RUG"]
 
 def fetch_dex_data(address: str) -> dict:
@@ -41,6 +41,7 @@ def fetch_dex_data(address: str) -> dict:
 
         pair = sorted(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0), reverse=True)[0]
         
+        chain_id = pair.get("chainId", "UNKNOWN").upper()
         token_name = pair.get("baseToken", {}).get("name", "Unknown")
         symbol = pair.get("baseToken", {}).get("symbol", "UNKNOWN")
         vol_5m = pair.get("volume", {}).get("m5", 0.0)
@@ -68,6 +69,7 @@ def fetch_dex_data(address: str) -> dict:
             hold_time = "5 to 10 MINUTES"
 
         return {
+            "chain": chain_id,
             "name": token_name,
             "symbol": symbol,
             "status": status,
@@ -79,7 +81,7 @@ def fetch_dex_data(address: str) -> dict:
             "sells": sells_5m,
             "forecast": forecast,
             "hold_time": hold_time,
-            "dex_url": pair.get("url", f"https://dexscreener.com/solana/{address}")
+            "dex_url": pair.get("url", f"https://dexscreener.com/{chain_id.lower()}/{address}")
         }
     except Exception as e:
         logger.error(f"Error fetching DexScreener data: {e}")
@@ -101,9 +103,8 @@ async def handle_address_paste(update: Update, context: ContextTypes.DEFAULT_TYP
 
     msg = (
         f"{data['signal_type']}\n"
-        f"**Chain:** SOLANA\n"
-        f"**Token:** ${data['symbol']} ({data['name']})\n"
-        f"🛡️ **Solana Security:** RugCheck Passed\n\n"
+        f"**Chain:** {data['chain']}\n"
+        f"**Token:** ${data['symbol']} ({data['name']})\n\n"
         f"**Rating:** {data['status']}\n"
         f"**5m Volume:** ${data['vol_5m']:,.2f}\n"
         f"**Liquidity:** ${data['liquidity']:,.2f}\n"
@@ -121,55 +122,42 @@ async def handle_address_paste(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- AUTOMATED 24/7 LAUNCH STREAM ---
 async def automated_stream_loop(app):
-    logger.info("WebSocket Streaming Engine & Interactive Bot Active")
+    logger.info("Streaming Engine Active")
     
     while True:
-        sample_launch = {
-            "address": "9sCX2joHc7Zwuu fia1sCYsW88SHoKPbB4xaLU8B3pump",
-            "name": "CAT BILL",
-            "symbol": "CATBILL",
-            "initial_sol": 30.05,
-            "deployer": "8TdR7Tgy..."
-        }
-        
-        token_name = sample_launch.get("name", "").upper()
-        sol_amount = sample_launch.get("initial_sol", 0.0)
+        try:
+            # Polls DexScreener for newly boosted/trending tokens across DEXs
+            res = requests.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=10).json()
+            if isinstance(res, list) and len(res) > 0:
+                top_token = res[0]
+                address = top_token.get("tokenAddress")
+                if address:
+                    data = fetch_dex_data(address)
+                    if data and TELEGRAM_CHAT_ID:
+                        msg = (
+                            f"⚡ **LIVE TRENDING LAUNCH ALERT** ⚡\n"
+                            f"{data['signal_type']}\n"
+                            f"**Chain:** {data['chain']}\n"
+                            f"**Token:** ${data['symbol']} ({data['name']})\n\n"
+                            f"**5m Volume:** ${data['vol_5m']:,.2f}\n"
+                            f"**Liquidity:** ${data['liquidity']:,.2f}\n"
+                            f"**Buy Ratio:** {data['buy_ratio']:.1f}% ({data['buys']} buys / {data['sells']} sells)\n\n"
+                            f"📊 **FORECAST:**\n"
+                            f"{data['forecast']}\n"
+                            f"• **Recommended Duration:** {data['hold_time']}\n\n"
+                            f"📋 **Contract Address:**\n`{address}`\n\n"
+                            f"📍 [View DEXScreener]({data['dex_url']})"
+                        )
+                        await app.bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=msg,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=True
+                        )
+        except Exception as e:
+            logger.error(f"Error in stream loop: {e}")
 
-        if sol_amount >= MIN_INITIAL_SOL and not any(k in token_name for k in BLOCKED_KEYWORDS):
-            data = fetch_dex_data(sample_launch["address"])
-            
-            if data and TELEGRAM_CHAT_ID:
-                msg = (
-                    f"⚡ **EARLY BLOCKCHAIN LAUNCH ALERT** ⚡\n"
-                    f"{data['signal_type']}\n"
-                    f"**Chain:** SOLANA\n"
-                    f"**Token:** ${data['symbol']} ({data['name']})\n"
-                    f"🛡️ **Solana Security:** RugCheck Passed\n\n"
-                    f"**Initial Pool SOL:** {sol_amount:.2f} SOL\n"
-                    f"**5m Volume:** ${data['vol_5m']:,.2f}\n"
-                    f"**Liquidity:** ${data['liquidity']:,.2f}\n"
-                    f"**Buy Ratio:** {data['buy_ratio']:.1f}% ({data['buys']} buys / {data['sells']} sells)\n\n"
-                    f"📊 **HOLDING VALUE & DURATION FORECAST:**\n"
-                    f"{data['forecast']}\n"
-                    f"• **Initial Hold ($100):** $100.00\n"
-                    f"• **Est. Value at Target:** $200.00 (+ $100.00)\n"
-                    f"• **Recommended Hold Duration:** {data['hold_time']}\n"
-                    f"• **Take Profit Targets:** 1.5x ($150) | 2x ($200) | 3x ($300)\n\n"
-                    f"📋 **Contract Address:**\n`{sample_launch['address']}`\n\n"
-                    f"📍 [View DEXScreener]({data['dex_url']})"
-                )
-                
-                try:
-                    await app.bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID,
-                        text=msg,
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send stream alert: {e}")
-
-        await asyncio.sleep(60)
+        await asyncio.sleep(120)
 
 async def main():
     threading.Thread(target=run_web_server, daemon=True).start()
