@@ -172,11 +172,9 @@ async def automated_stream_loop(app):
         await asyncio.sleep(60)
 
 async def main():
-    # Start web server thread to satisfy Render Free Web Service requirement
     threading.Thread(target=run_web_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address_paste))
 
     await app.initialize()
