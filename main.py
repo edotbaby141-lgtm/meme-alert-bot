@@ -29,11 +29,11 @@ TELEGRAM_CHAT_ID = "5642314005"
 # Sound alert audio file (MP3 / WAV URL) for STRONG signals
 ALERT_AUDIO_URL = "https://www.soundjay.com/buttons/sounds/button-3.mp3"
 
-# --- ADJUSTED MOMENTUM FILTERS (Optimized for Boosted Tokens) ---
-MIN_MARKET_CAP = 30000.0      # Adjusted to $30k (from $100k) to catch early breakouts
-MIN_LIQUIDITY = 15000.0       # Adjusted to $15k (from $30k)
-MIN_5M_VOLUME = 8000.0        # Adjusted to $8k 5m volume surge
-MIN_BUY_RATIO = 55.0          # 55%+ Buyers vs Sellers
+# --- ADJUSTED MOMENTUM FILTERS ---
+MIN_MARKET_CAP = 25000.0      # Minimum Market Cap ($25k)
+MIN_LIQUIDITY = 10000.0       # Minimum Liquidity ($10k)
+MIN_5M_VOLUME = 5000.0        # Minimum 5m Volume Surge ($5k)
+MIN_BUY_RATIO = 50.0          # 50%+ Buyers vs Sellers
 ALLOWED_CHAINS = ["solana", "ethereum", "arbitrum", "base", "bsc"]
 
 alerted_tokens = set()
@@ -45,7 +45,6 @@ async def fetch_dex_data(client: httpx.AsyncClient, address: str) -> dict:
     try:
         response = await client.get(url, timeout=10.0)
         if response.status_code != 200:
-            logger.warning(f"DexScreener API returned HTTP {response.status_code} for {address}")
             return None
             
         res = response.json()
@@ -68,11 +67,11 @@ async def fetch_dex_data(client: httpx.AsyncClient, address: str) -> dict:
         buy_ratio = (buys_5m / total_txns * 100) if total_txns > 0 else 0.0
 
         # Dynamic Status Rating Matrix
-        if buy_ratio >= 65.0 and liquidity >= 30000 and vol_5m >= 20000:
+        if buy_ratio >= 65.0 and liquidity >= 25000 and vol_5m >= 15000:
             status = "STRONG 🟢"
             signal_type = "🟢 CONFIRMED BREAKOUT MOMENTUM 🟢"
             is_strong = True
-        elif buy_ratio <= 40.0 or liquidity < 10000:
+        elif buy_ratio <= 40.0 or liquidity < 8000:
             status = "WEAK / HIGH RISK 🔴"
             signal_type = "🔴 UNTESTED / LOW BUY PRESSURE 🔴"
             is_strong = False
@@ -151,41 +150,44 @@ async def handle_address_paste(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- AUTOMATED 24/7 BREAKOUT MONITORING LOOP ---
 async def automated_stream_loop(app):
-    logger.info("Breakout Engine Active: Scanning DexScreener for Momentum Signals...")
+    logger.info("⚡ BREAKOUT ENGINE ACTIVE: SCANNING DEXSCREENER")
     
     async with httpx.AsyncClient() as client:
         while True:
             try:
+                # DexScreener Boosts endpoint returns list of boosted tokens
                 response = await client.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=10.0)
                 if response.status_code == 200:
                     res = response.json()
                     
-                    if isinstance(res, list) and len(res) > 0:
-                        logger.info(f"--- Scanning top {min(15, len(res))} boosted tokens ---")
-                        for item in res[:15]:
+                    # Handle both standard list responses and object responses
+                    items = res.get("data", res) if isinstance(res, dict) else res
+                    
+                    if isinstance(items, list) and len(items) > 0:
+                        logger.info(f"🔍 Evaluated {len(items)} boosted tokens...")
+                        for item in items[:20]:
                             address = item.get("tokenAddress")
                             
                             if address and address not in alerted_tokens:
                                 data = await fetch_dex_data(client, address)
                                 
                                 if data:
-                                    # Print clear diagnostic log in Render console
+                                    # Output evaluation metrics directly into Render Console
                                     logger.info(
-                                        f"Check ${data['symbol']} ({data['chain']}) | "
+                                        f"CHECK: ${data['symbol']} ({data['chain']}) | "
                                         f"MC: ${data['mcap']:,.0f} | Liq: ${data['liquidity']:,.0f} | "
                                         f"Vol5m: ${data['vol_5m']:,.0f} | BuyRatio: {data['buy_ratio']:.1f}%"
                                     )
 
-                                    # Check Filter Criteria
+                                    # Filter Validation
                                     if (data['chain_raw'] in ALLOWED_CHAINS and 
                                         data['mcap'] >= MIN_MARKET_CAP and 
                                         data['liquidity'] >= MIN_LIQUIDITY and 
                                         data['vol_5m'] >= MIN_5M_VOLUME and 
                                         data['buy_ratio'] >= MIN_BUY_RATIO):
                                         
-                                        # Store address ONLY when alert triggers
                                         alerted_tokens.add(address)
-                                        logger.info(f"🚀 MATCH FOUND! Sending alert for ${data['symbol']}")
+                                        logger.info(f"🚨 MATCH CONFIRMED! Sending Telegram Alert for ${data['symbol']}")
 
                                         msg = (
                                             f"🚨 **CONFIRMED MOMENTUM BREAKOUT** 🚨\n"
@@ -206,7 +208,6 @@ async def automated_stream_loop(app):
                                             f"📍 [Open DEXScreener Chart]({data['dex_url']})"
                                         )
                                         
-                                        # Send text alert
                                         await app.bot.send_message(
                                             chat_id=TELEGRAM_CHAT_ID,
                                             text=msg,
@@ -215,7 +216,6 @@ async def automated_stream_loop(app):
                                             disable_notification=not data['is_strong']
                                         )
 
-                                        # Optional audio alert
                                         if data['is_strong']:
                                             try:
                                                 await app.bot.send_audio(
@@ -226,17 +226,17 @@ async def automated_stream_loop(app):
                                                     disable_notification=False
                                                 )
                                             except Exception as audio_err:
-                                                logger.error(f"Failed to send alert sound: {audio_err}")
+                                                logger.error(f"Audio error: {audio_err}")
 
-                                if len(alerted_tokens) > 200:
+                                if len(alerted_tokens) > 300:
                                     alerted_tokens.clear()
                 else:
-                    logger.warning(f"DexScreener Boosts API returned status {response.status_code}")
+                    logger.warning(f"DexScreener API Status: {response.status_code}")
 
             except Exception as e:
                 logger.error(f"Error in breakout loop: {e}")
 
-            await asyncio.sleep(30)
+            await asyncio.sleep(20)
 
 async def main():
     threading.Thread(target=run_web_server, daemon=True).start()
@@ -245,14 +245,17 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address_paste))
 
     await app.initialize()
-    
-    # Prevents conflict errors on new deployments
     await app.bot.delete_webhook(drop_pending_updates=True)
-
     await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
 
-    await automated_stream_loop(app)
+    # Launch automated scanning loop as a non-blocking background task
+    asyncio.create_task(automated_stream_loop(app))
+
+    # Keep polling active on the primary thread
+    await app.updater.start_polling(drop_pending_updates=True)
+    
+    # Keep main task alive indefinitely
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
