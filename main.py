@@ -34,7 +34,7 @@ MIN_MARKET_CAP = 100000.0     # $100k Minimum Market Cap
 MIN_LIQUIDITY = 30000.0       # $30k Minimum Liquidity
 MIN_5M_VOLUME = 20000.0       # $20k Minimum 5m Volume Surge
 MIN_BUY_RATIO = 65.0          # 65%+ Buyers vs Sellers
-ALLOWED_CHAINS = ["SOLANA", "ETHEREUM", "ARBITRUM", "BASE", "BSC"]
+ALLOWED_CHAINS = ["solana", "ethereum", "arbitrum", "base", "bsc"]
 
 seen_tokens = set()
 
@@ -45,16 +45,20 @@ async def fetch_dex_data(client: httpx.AsyncClient, address: str) -> dict:
     try:
         response = await client.get(url, timeout=10.0)
         if response.status_code != 200:
+            # ADDED: Diagnostic logging for failed individual token lookups
+            logger.warning(f"DexScreener API error for address {address}: Status {response.status_code}")
             return None
             
         res = response.json()
         pairs = res.get("pairs")
         if not pairs:
+            # ADDED: Log when a token address lacks valid trading pairs
+            logger.info(f"No active liquidity pairs found for address: {address}")
             return None
 
         pair = sorted(pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0), reverse=True)[0]
         
-        chain_id = pair.get("chainId", "UNKNOWN").upper()
+        chain_id = pair.get("chainId", "UNKNOWN").lower()
         token_name = pair.get("baseToken", {}).get("name", "Unknown")
         symbol = pair.get("baseToken", {}).get("symbol", "UNKNOWN")
         mcap = pair.get("fdv", 0.0) or pair.get("marketCap", 0.0)
@@ -92,7 +96,8 @@ async def fetch_dex_data(client: httpx.AsyncClient, address: str) -> dict:
             forecast = "🔥 HIGH VOLATILITY SURGE (Quick Exit Targets)"
 
         return {
-            "chain": chain_id,
+            "chain": chain_id.upper(),
+            "chain_raw": chain_id,
             "name": token_name,
             "symbol": symbol,
             "mcap": mcap,
@@ -106,7 +111,7 @@ async def fetch_dex_data(client: httpx.AsyncClient, address: str) -> dict:
             "sells": sells_5m,
             "forecast": forecast,
             "hold_time": hold_time,
-            "dex_url": pair.get("url", f"https://dexscreener.com/{chain_id.lower()}/{address}")
+            "dex_url": pair.get("url", f"https://dexscreener.com/{chain_id}/{address}")
         }
     except Exception as e:
         logger.error(f"Error fetching DexScreener data: {e}")
@@ -159,7 +164,7 @@ async def automated_stream_loop(app):
                     res = response.json()
                     
                     if isinstance(res, list) and len(res) > 0:
-                        for item in res[:10]:
+                        for item in res[:15]:
                             address = item.get("tokenAddress")
                             
                             if address and address not in seen_tokens:
@@ -167,7 +172,7 @@ async def automated_stream_loop(app):
                                 
                                 # Check Filter Criteria
                                 if (data and 
-                                    data['chain'] in ALLOWED_CHAINS and 
+                                    data['chain_raw'] in ALLOWED_CHAINS and 
                                     data['mcap'] >= MIN_MARKET_CAP and 
                                     data['liquidity'] >= MIN_LIQUIDITY and 
                                     data['vol_5m'] >= MIN_5M_VOLUME and 
@@ -194,7 +199,16 @@ async def automated_stream_loop(app):
                                         f"📍 [Open DEXScreener Chart]({data['dex_url']})"
                                     )
                                     
-                                    # Play audio alert and enable loud sound notification for STRONG setups
+                                    # Always send text alert first
+                                    await app.bot.send_message(
+                                        chat_id=TELEGRAM_CHAT_ID,
+                                        text=msg,
+                                        parse_mode="Markdown",
+                                        disable_web_page_preview=True,
+                                        disable_notification=not data['is_strong']
+                                    )
+
+                                    # Send sound alert if strong setup
                                     if data['is_strong']:
                                         try:
                                             await app.bot.send_audio(
@@ -206,23 +220,21 @@ async def automated_stream_loop(app):
                                             )
                                         except Exception as audio_err:
                                             logger.error(f"Failed to send alert sound: {audio_err}")
+                                else:
+                                    # ADDED: Diagnostic logging when tokens are skipped by filters
+                                    if data:
+                                        logger.info(f"Token ${data['symbol']} filtered out: Mcap=${data['mcap']:,.0f}, Vol5m=${data['vol_5m']:,.0f}, BuyRatio={data['buy_ratio']:.1f}%")
 
-                                    # Send main signal message
-                                    await app.bot.send_message(
-                                        chat_id=TELEGRAM_CHAT_ID,
-                                        text=msg,
-                                        parse_mode="Markdown",
-                                        disable_web_page_preview=True,
-                                        disable_notification=not data['is_strong']
-                                    )
-                                    
                                 if len(seen_tokens) > 300:
                                     seen_tokens.clear()
+                else:
+                    # ADDED: Log non-200 responses from token-boosts endpoint
+                    logger.warning(f"Failed to fetch boosted tokens. Endpoint status: {response.status_code}")
                                     
             except Exception as e:
                 logger.error(f"Error in breakout loop: {e}")
 
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
 async def main():
     threading.Thread(target=run_web_server, daemon=True).start()
