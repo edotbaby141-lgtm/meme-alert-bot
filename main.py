@@ -29,12 +29,12 @@ TELEGRAM_CHAT_ID = "5642314005"
 # Sound alert audio file (MP3 / WAV URL) for STRONG signals
 ALERT_AUDIO_URL = "https://www.soundjay.com/buttons/sounds/button-3.mp3"
 
-# --- ADJUSTED MOMENTUM FILTERS ---
-MIN_MARKET_CAP = 25000.0      # Minimum Market Cap ($25k)
-MIN_LIQUIDITY = 10000.0       # Minimum Liquidity ($10k)
-MIN_5M_VOLUME = 5000.0        # Minimum 5m Volume Surge ($5k)
+# --- MOMENTUM FILTERS ---
+MIN_MARKET_CAP = 25000.0      # $25k Minimum FDV
+MIN_LIQUIDITY = 10000.0       # $10k Minimum Liquidity
+MIN_5M_VOLUME = 5000.0        # $5k 5m Volume Surge
 MIN_BUY_RATIO = 50.0          # 50%+ Buyers vs Sellers
-ALLOWED_CHAINS = ["solana", "ethereum", "arbitrum", "base", "bsc"]
+ALLOWED_CHAINS = ["solana", "ethereum", "arbitrum", "base", "bsc", "robinhood"]
 
 alerted_tokens = set()
 
@@ -57,7 +57,10 @@ async def fetch_dex_data(client: httpx.AsyncClient, address: str) -> dict:
         chain_id = pair.get("chainId", "UNKNOWN").lower()
         token_name = pair.get("baseToken", {}).get("name", "Unknown")
         symbol = pair.get("baseToken", {}).get("symbol", "UNKNOWN")
+        
+        # Priority on FDV to match Photon/BullX valuation display
         mcap = pair.get("fdv", 0.0) or pair.get("marketCap", 0.0)
+        
         vol_5m = pair.get("volume", {}).get("m5", 0.0)
         liquidity = pair.get("liquidity", {}).get("usd", 0.0)
         
@@ -150,44 +153,41 @@ async def handle_address_paste(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- AUTOMATED 24/7 BREAKOUT MONITORING LOOP ---
 async def automated_stream_loop(app):
-    logger.info("⚡ BREAKOUT ENGINE ACTIVE: SCANNING DEXSCREENER")
+    logger.info("⚡ SCANNER ENGINE STARTED: Watching DexScreener Boosts...")
     
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                # DexScreener Boosts endpoint returns list of boosted tokens
                 response = await client.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=10.0)
                 if response.status_code == 200:
                     res = response.json()
-                    
-                    # Handle both standard list responses and object responses
                     items = res.get("data", res) if isinstance(res, dict) else res
                     
                     if isinstance(items, list) and len(items) > 0:
-                        logger.info(f"🔍 Evaluated {len(items)} boosted tokens...")
-                        for item in items[:20]:
+                        logger.info(f"Checking top {len(items[:15])} boosted tokens...")
+                        for item in items[:15]:
                             address = item.get("tokenAddress")
                             
+                            # Only skip tokens that ALREADY triggered an alert
                             if address and address not in alerted_tokens:
                                 data = await fetch_dex_data(client, address)
                                 
                                 if data:
-                                    # Output evaluation metrics directly into Render Console
                                     logger.info(
-                                        f"CHECK: ${data['symbol']} ({data['chain']}) | "
+                                        f"EVALUATING ${data['symbol']} ({data['chain']}) | "
                                         f"MC: ${data['mcap']:,.0f} | Liq: ${data['liquidity']:,.0f} | "
-                                        f"Vol5m: ${data['vol_5m']:,.0f} | BuyRatio: {data['buy_ratio']:.1f}%"
+                                        f"BuyRatio: {data['buy_ratio']:.1f}%"
                                     )
 
-                                    # Filter Validation
                                     if (data['chain_raw'] in ALLOWED_CHAINS and 
                                         data['mcap'] >= MIN_MARKET_CAP and 
                                         data['liquidity'] >= MIN_LIQUIDITY and 
                                         data['vol_5m'] >= MIN_5M_VOLUME and 
                                         data['buy_ratio'] >= MIN_BUY_RATIO):
                                         
+                                        # Store address ONLY on confirmed alert
                                         alerted_tokens.add(address)
-                                        logger.info(f"🚨 MATCH CONFIRMED! Sending Telegram Alert for ${data['symbol']}")
+                                        logger.info(f"🚨 ALERT TRIGGERED: Sending Telegram message for ${data['symbol']}")
 
                                         msg = (
                                             f"🚨 **CONFIRMED MOMENTUM BREAKOUT** 🚨\n"
@@ -248,13 +248,13 @@ async def main():
     await app.bot.delete_webhook(drop_pending_updates=True)
     await app.start()
 
-    # Launch automated scanning loop as a non-blocking background task
+    # Create background scanner task
     asyncio.create_task(automated_stream_loop(app))
 
-    # Keep polling active on the primary thread
+    # Start listener polling
     await app.updater.start_polling(drop_pending_updates=True)
-    
-    # Keep main task alive indefinitely
+
+    # Keep program execution open
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
