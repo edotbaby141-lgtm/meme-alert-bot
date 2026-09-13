@@ -17,7 +17,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8804502384:AAHYjDaiM_sj7p3t1MRCSKJA5XMoUmqWINo")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5642314005")
-ADMIN_USER_IDS = [int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "5642314005").split(",")]
+ADMIN_USER_IDS = [int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "5642314005").split(",") if uid.isdigit()]
 
 DEXSCREENER_BATCH_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 DEXSCREENER_BOOSTED_TOP = "https://api.dexscreener.com/token-boosts/top/v1"
@@ -167,22 +167,22 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
     status = security_info.get("status", "UNVERIFIED")
     sec_badge = "🟢 SAFE" if status == "SAFE" else ("🔴 UNSAFE" if status == "UNSAFE" else "🟡 UNVERIFIED")
     
-    # Calculate Targets & Stop Losses
+    # Calculate Dynamic Exit Targets
     tp1 = price_usd * 1.25  # +25%
     tp2 = price_usd * 1.50  # +50%
     tp3 = price_usd * 2.00  # +100% (2x)
     sl = price_usd * 0.85   # -15% Stop Loss
 
-    # Dynamic Hold Recommendation based on 5m Volume Intensity
+    # Dynamic Strategy Setup based on Volume Profile
     if vol_5m >= 50000:
-        hold_time = "⚡ Ultra Scalp (5 to 20 minutes)"
-        entry_strategy = "Market entry on 1m pullback"
+        hold_time = "⚡ Scalp (5 to 20 mins)"
+        entry_strategy = "Immediate market fill on 1m pullback"
     elif vol_5m >= 10000:
         hold_time = "🕒 Short Swing (1 to 4 hours)"
-        entry_strategy = "Limit order at 3-5% dip level"
+        entry_strategy = "Limit order at 3-5% pullback zone"
     else:
         hold_time = "⏳ Low Volatility Watch (15m to 1 hour)"
-        entry_strategy = "Scalp limit order on key support"
+        entry_strategy = "Limit order at immediate micro support"
 
     msg = (
         f"<b>🚨 ACCELERATION ALERT: {symbol}</b>\n\n"
@@ -208,13 +208,16 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
         f"<a href='{dex_url}'>📈 View on DEXScreener</a>"
     )
 
-    logging.info(f"DISPATCHING TELEGRAM ALERT FOR {symbol}...")
-    await app.bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=msg,
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
+    try:
+        logging.info(f"DISPATCHING TELEGRAM ALERT FOR {symbol}...")
+        await app.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=msg,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        logging.error(f"Failed to send Telegram message: {e}")
 
 async def monitor_market(app: Application):
     async with aiohttp.ClientSession() as session:
@@ -222,17 +225,18 @@ async def monitor_market(app: Application):
             async with STATE_LOCK:
                 current_watchlist = list(WATCHLIST)
 
-            # High-Volume Trending Token Discovery Endpoint
+            # High-Volume Trending Token Discovery Endpoint (Robust Parsing)
             if not current_watchlist:
                 try:
                     async with session.get(DEXSCREENER_BOOSTED_TOP, timeout=8) as resp:
                         if resp.status == 200:
-                            boosted = await resp.json()
-                            if isinstance(boosted, list):
+                            raw_data = await resp.json()
+                            items = raw_data if isinstance(raw_data, list) else raw_data.get("tokens", [])
+                            if isinstance(items, list):
                                 current_watchlist = [
-                                    item.get("tokenAddress") for item in boosted 
+                                    item.get("tokenAddress") for item in items 
                                     if isinstance(item, dict) and item.get("tokenAddress")
-                                ][:20]
+                                ][:25]
                 except Exception as e:
                     logging.error(f"Trending discovery error: {e}")
 
@@ -245,7 +249,7 @@ async def monitor_market(app: Application):
                             pairs = data.get("pairs", [])
                             now = datetime.now().timestamp()
 
-                            logging.info(f"Processing {len(pairs)} pairs...")
+                            logging.info(f"Processing {len(pairs)} active pairs...")
 
                             for pair in pairs:
                                 token_addr = normalize_address(pair.get("baseToken", {}).get("address", ""))
@@ -256,6 +260,7 @@ async def monitor_market(app: Application):
                                 history = PRICE_HISTORY[token_addr]
                                 history.append((now, vol_5m, mcap))
 
+                                # Requires 2 ticks (approx 10-20 seconds) to determine dynamic volume acceleration
                                 if len(history) < 2:
                                     continue
 
