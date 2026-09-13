@@ -1,389 +1,229 @@
-import os
-import json
 import asyncio
+import json
 import logging
-import threading
-import httpx
-from flask import Flask
+import re
+import html
+from collections import deque, defaultdict
+from datetime import datetime
+import aiohttp
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- LOGGING CONFIGURATION ---
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ==========================================
+# CONFIGURATION
+# ==========================================
+TELEGRAM_BOT_TOKEN = "8804502384:AAHYjDaiM_sj7p3t1MRCSKJA5XMoUmqWINo"
+TELEGRAM_CHAT_ID = "5642314005"
+ADMIN_USER_IDS = [5642314005]  # Restricts /add and /remove commands to you
 
-# --- SECURE CREDENTIALS ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+DEXSCREENER_BATCH_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{}"
+GOPLUS_SOLANA_URL = "https://api.gopluslabs.io/api/v1/solana/token_security"
 
-# --- STRATEGY FILTERS FOR EARLY NEW LISTINGS ---
-EARLY_MIN_MARKET_CAP = 20000.0   # $20k Minimum FDV for new micro-caps
-EARLY_MIN_LIQUIDITY = 8000.0     # $8k Minimum Liquidity
-EARLY_MIN_5M_VOLUME = 3000.0     # $3k 5m Volume Surge
-MIN_BUY_RATIO = 50.0             # 50%+ Buyers vs Sellers
+POLL_INTERVAL = 10  # Seconds between market scans
+SNAPSHOT_WINDOW = 300  # 5-minute rolling window for expansion math
+MAX_SEEN_CACHE = 2000
 
-# --- INITIAL WATCHLIST TARGETS (TICKER TO ADDRESS / SEARCH MAP) ---
-DEFAULT_WATCHLIST_TOKENS = {
-    # High-Cap Trendings from DexScreener Watchlist UI
-    "AI": "0xBDA011D7F8EC00F66C1923B049B94c67d148d8b2",
-    "PONS": "0x1111111111111111111111111111111111111111",
-    "STONK": "0x2222222222222222222222222222222222222222",
-    "MEME": "0xb131f4a55907b10d1f0a50d8ab8fa09ec342cd74",
-    "MARSCOIN": "0x1395000000000000000000000000000000000000",
-    "ZCAT": "0x4444444444444444444444444444444444444444",
-    "CATE": "2R9hsvLbNvGUCKHywdVn6Rzg4UYtiQYHG9hygtrspump",
-    "CASHCAT": "0x1859000000000000000000000000000000000000",
-    "USELESS": "8DvNR14E5e5Cump2e7N2x4xypA2W14r9s4E3S4yupump",
-    "BONER": "0x4590000000000000000000000000000000000000",
-    "PEPE": "0x6982508145454ce325ddbe47a25d4ec3d2311933",
-    "ARB": "0x912ce59144191c1204e64559fe8253a0e49e6548",
-    "SUI": "0x2::sui::SUI"
-}
+# Criteria Thresholds
+MIN_5M_VOL_EXPANSION = 25.0  # % growth in 5m
+MIN_5M_MCAP_EXPANSION = 15.0 # % growth in 5m
+MIN_5M_VOLUME = 15000.0      # Minimum $ volume in 5m
 
-WATCHLIST_FILE = "watchlist.json"
-SEEN_FILE = "seen_tokens.json"
+# ==========================================
+# STATE & CACHE MANAGEMENT
+# ==========================================
+WATCHLIST = set()
+SEEN_TOKENS = set()
+PRICE_HISTORY = defaultdict(lambda: deque(maxlen=30))  # 5-minute sliding snapshot
 
-# --- PERSISTENT STORAGE MANAGERS ---
-def load_watchlist() -> dict:
-    if os.path.exists(WATCHLIST_FILE):
-        try:
-            with open(WATCHLIST_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"Error loading watchlist: {e}")
-    return DEFAULT_WATCHLIST_TOKENS.copy()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def save_watchlist(watchlist: dict):
-    try:
-        with open(WATCHLIST_FILE, "w") as f:
-            json.dump(watchlist, f, indent=4)
-    except Exception as e:
-        logger.error(f"Error saving watchlist: {e}")
+def normalize_address(address: str) -> str:
+    """Preserves Solana Base58 casing while lowercasing EVM addresses."""
+    if re.match(r"^0x[a-fA-F0-9]{40}$", address):
+        return address.lower()
+    return address.strip()
 
-def load_alerted_tokens() -> set:
-    if os.path.exists(SEEN_FILE):
-        try:
-            with open(SEEN_FILE, "r") as f:
-                return set(json.load(f))
-        except Exception as e:
-            logger.error(f"Error loading seen tokens: {e}")
-    return set()
-
-def save_alerted_tokens(tokens_set: set):
-    try:
-        capped = list(tokens_set)[-1500:]
-        with open(SEEN_FILE, "w") as f:
-            json.dump(capped, f)
-    except Exception as e:
-        logger.error(f"Error saving seen tokens: {e}")
-
-watchlist_tokens = load_watchlist()
-alerted_tokens = load_alerted_tokens()
-
-# --- FLASK HEALTH SERVER (KEEP-ALIVE BIND) ---
-web_app = Flask(__name__)
-
-@web_app.route('/')
-def health_check():
-    return "Bot Engine Operational 24/7", 200
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 8080))
-    web_app.run(host="0.0.0.0", port=port)
-
-# --- SANITIZE MARKDOWN ---
-def sanitize_md(text: str) -> str:
-    chars = ["*", "_", "`", "["]
-    for c in chars:
-        text = text.replace(c, f"\\{c}")
-    return text
-
-# --- PARSE DEX DATA ---
-def parse_pair_data(pair: dict) -> dict:
-    chain_id = pair.get("chainId", "UNKNOWN").lower()
-    token_name = sanitize_md(pair.get("baseToken", {}).get("name", "Unknown"))
-    symbol = sanitize_md(pair.get("baseToken", {}).get("symbol", "UNKNOWN"))
-    
-    mcap = float(pair.get("fdv", 0.0) or pair.get("marketCap", 0.0) or 0.0)
-    vol_5m = float(pair.get("volume", {}).get("m5", 0.0) or 0.0)
-    liquidity = float(pair.get("liquidity", {}).get("usd", 0.0) or 0.0)
-    
-    buys_5m = pair.get("txns", {}).get("m5", {}).get("buys", 0)
-    sells_5m = pair.get("txns", {}).get("m5", {}).get("sells", 0)
-    total_txns = buys_5m + sells_5m
-    buy_ratio = (buys_5m / total_txns * 100) if total_txns > 0 else 0.0
-
-    if buy_ratio >= 60.0 and liquidity >= 15000:
-        status = "STRONG 🟢"
-        signal_type = "🟢 CONFIRMED BULLISH MOMENTUM 🟢"
-    elif buy_ratio <= 40.0:
-        status = "WEAK / RISK 🔴"
-        signal_type = "🔴 HIGH SELLING PRESSURE 🔴"
-    else:
-        status = "NEUTRAL 🟡"
-        signal_type = "🟡 CONSOLIDATION RANGE 🟡"
-
-    if mcap >= 100000000.0: # $100M+ Market Cap
-        hold_time = "📈 MACRO TREND HOLD (Days to Weeks)"
-        forecast = "🚀 MAJOR HIGH-CAP EXPANSION MOVE"
-    elif mcap >= 1000000.0: # $1M+
-        hold_time = "⏱️ MID-TERM SWING (Hours to Days)"
-        forecast = "⚡ ESTABLISHED BREAKOUT (Continuation)"
-    else:
-        hold_time = "⚡ FAST SCALP ENTRY (3 to 30 Mins)"
-        forecast = "🔥 EARLY MICRO-CAP SURGE (High Volatility)"
-
-    return {
-        "chain": chain_id.upper(),
-        "name": token_name,
-        "symbol": symbol,
-        "mcap": mcap,
-        "status": status,
-        "signal_type": signal_type,
-        "vol_5m": vol_5m,
-        "liquidity": liquidity,
-        "buy_ratio": buy_ratio,
-        "buys": buys_5m,
-        "sells": sells_5m,
-        "forecast": forecast,
-        "hold_time": hold_time,
-        "dex_url": pair.get("url", f"https://dexscreener.com/{chain_id}/{pair.get('baseToken', {}).get('address', '')}")
+async def save_state_async():
+    """Non-blocking asynchronous file state persistence."""
+    data = {
+        "watchlist": list(WATCHLIST),
+        "seen_tokens": list(SEEN_TOKENS)[-MAX_SEEN_CACHE:]
     }
+    await asyncio.to_thread(lambda: open("bot_state.json", "w").write(json.dumps(data, indent=2)))
 
-# --- BATCH DEX DATA FETCH ---
-async def fetch_batch_dex_data(client: httpx.AsyncClient, addresses: list) -> dict:
-    if not addresses:
-        return {}
-        
-    query_str = ",".join(addresses[:30])
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{query_str}"
-    
+async def load_state_async():
+    """Loads state from file if available."""
+    global WATCHLIST, SEEN_TOKENS
     try:
-        response = await client.get(url, timeout=10.0)
-        if response.status_code != 200:
-            return {}
-            
-        res = response.json()
-        pairs = res.get("pairs")
-        if not pairs:
-            return {}
+        content = await asyncio.to_thread(lambda: open("bot_state.json", "r").read())
+        data = json.loads(content)
+        WATCHLIST = set(data.get("watchlist", []))
+        SEEN_TOKENS = set(data.get("seen_tokens", []))
+    except FileNotFoundError:
+        WATCHLIST = set()
+        SEEN_TOKENS = set()
 
-        results = {}
-        for pair in pairs:
-            raw_addr = pair.get("baseToken", {}).get("address")
-            if not raw_addr:
-                continue
-            
-            addr_key = raw_addr.lower()
-            liq = float(pair.get("liquidity", {}).get("usd", 0.0) or 0.0)
-            
-            if addr_key not in results or liq > results[addr_key].get("liquidity", 0.0):
-                results[addr_key] = parse_pair_data(pair)
-                
-        return results
+# ==========================================
+# SECURITY AUDIT ENGINE (GOPLUS)
+# ==========================================
+async def check_goplus_security(session: aiohttp.ClientSession, chain: str, token_address: str) -> str:
+    """Verifies token safety returning SAFE, UNSAFE, or UNVERIFIED."""
+    try:
+        if chain.lower() in ["solana", "sol"]:
+            async with session.get(GOPLUS_SOLANA_URL, params={"contract_addresses": [token_address]}, timeout=8) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    res = data.get("result", {}).get(token_address, {})
+                    if res.get("freezable", {}).get("status") == "1" or res.get("mintable", {}).get("status") == "1":
+                        return "UNSAFE"
+                    return "SAFE"
+        else:
+            # Assumes EVM chain mapping (eth, base, bsc, arbitrum, etc.)
+            chain_id = "1" if chain.lower() in ["ethereum", "eth"] else "8453"  # Default Base (8453)
+            url = GOPLUS_EVM_URL.format(chain_id)
+            async with session.get(url, params={"contract_addresses": token_address}, timeout=8) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    res = data.get("result", {}).get(token_address.lower(), {})
+                    if res.get("is_honeypot") == "1" or float(res.get("cannot_sell_all", 0)) == 1:
+                        return "UNSAFE"
+                    return "SAFE"
     except Exception as e:
-        logger.error(f"Error fetching DexScreener batch: {e}")
-        return {}
+        logging.error(f"GoPlus check error for {token_address}: {e}")
+    return "UNVERIFIED"
 
-# --- TELEGRAM DISPATCHER ---
-async def dispatch_telegram_alert(app, addr: str, data: dict, tag: str = "BREAKOUT"):
-    msg = (
-        f"🚨 **{tag}** 🚨\n"
-        f"{data['signal_type']}\n\n"
-        f"**Chain:** {data['chain']}\n"
-        f"**Token:** ${data['symbol']} ({data['name']})\n\n"
-        f"⭐ **Rating:** {data['status']}\n"
-        f"💰 **Market Cap (FDV):** ${data['mcap']:,.2f}\n"
-        f"🔥 **5m Volume:** ${data['vol_5m']:,.2f}\n"
-        f"💧 **Liquidity:** ${data['liquidity']:,.2f}\n"
-        f"🟢 **Buy Ratio:** {data['buy_ratio']:.1f}% ({data['buys']} buys / {data['sells']} sells)\n\n"
-        f"📊 **EXECUTION PLAN:**\n"
-        f"{data['forecast']}\n"
-        f"• **Hold Duration:** {data['hold_time']}\n"
-        f"• **Take Profit Scale:** TP1 1.5x | TP2 2x | Runner 5x\n"
-        f"• **Stop Loss:** Max -15% or break of recent swing low\n\n"
-        f"📋 **Contract Address:**\n`{addr}`\n\n"
-        f"📍 [Open DEXScreener Chart]({data['dex_url']})"
-    )
+# ==========================================
+# MARKET TRACKING & TELEGRAM DISPATCH
+# ==========================================
+async def dispatch_telegram_alert(app: Application, pair: dict, security_status: str, vol_growth: float, mcap_growth: float):
+    """Formats cleanly using HTML escape mode to eliminate rendering failures."""
+    base_token = pair.get("baseToken", {})
+    name = html.escape(base_token.get("name", "Unknown"))
+    symbol = html.escape(base_token.get("symbol", "UNKNOWN"))
+    address = pair.get("baseToken", {}).get("address", "")
+    chain = pair.get("chainId", "N/A").upper()
     
+    price_usd = float(pair.get("priceUsd", 0))
+    mcap = float(pair.get("fdv", pair.get("marketCap", 0)))
+    vol_5m = float(pair.get("volume", {}).get("m5", 0))
+    dex_url = pair.get("url", "")
+
+    sec_badge = "🟢 SAFE" if security_status == "SAFE" else "🟡 UNVERIFIED"
+    
+    msg = (
+        f"<b>🚨 ACCELERATION ALERT: {symbol}</b>\n\n"
+        f"<b>Token:</b> {name} (${symbol})\n"
+        f"<b>Chain:</b> {chain}\n"
+        f"<b>Security:</b> {sec_badge}\n\n"
+        f"<b>Market Cap:</b> ${mcap:,.0f} (<b>+{mcap_growth:.1f}%</b> in 5m)\n"
+        f"<b>5m Volume:</b> ${vol_5m:,.0f} (<b>+{vol_growth:.1f}%</b> in 5m)\n"
+        f"<b>Price:</b> ${price_usd:.8f}\n\n"
+        f"<b>Contract:</b> <code>{address}</code>\n"
+        f"<a href='{dex_url}'>📈 View on DEXScreener</a>"
+    )
+
     await app.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
         text=msg,
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-        disable_notification=False
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
 
-# --- 1. WATCHLIST ENGINE ---
-async def big_coins_stream_loop(app):
-    logger.info("🎯 WATCHLIST ENGINE STARTED...")
-    async with httpx.AsyncClient() as client:
+async def monitor_market(app: Application):
+    """Main scanning loop monitoring real expansion metrics using rolling windows."""
+    async with aiohttp.ClientSession() as session:
         while True:
-            try:
-                addresses = list(watchlist_tokens.values())
-                for i in range(0, len(addresses), 30):
-                    batch = addresses[i:i+30]
-                    data_map = await fetch_batch_dex_data(client, batch)
-                    
-                    for symbol, raw_addr in list(watchlist_tokens.items()):
-                        addr_key = raw_addr.lower()
-                        data = data_map.get(addr_key)
-                        
-                        # Fires on high buy volume surge before major continuation moves
-                        if data and data['buy_ratio'] >= 55.0 and data['vol_5m'] >= 5000.0:
-                            alert_key = f"{addr_key}_big_surge"
-                            if alert_key not in alerted_tokens:
-                                alerted_tokens.add(alert_key)
-                                save_alerted_tokens(alerted_tokens)
-                                await dispatch_telegram_alert(app, raw_addr, data, tag=f"WATCHLIST SURGE (${symbol})")
-                    await asyncio.sleep(2)
-            except Exception as e:
-                logger.error(f"Error in watchlist loop: {e}")
-            await asyncio.sleep(35)
+            if WATCHLIST:
+                addresses = ",".join(list(WATCHLIST)[:30])
+                try:
+                    async with session.get(DEXSCREENER_BATCH_URL.format(addresses), timeout=10) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            pairs = data.get("pairs", [])
+                            now = datetime.now().timestamp()
 
-# --- 2. EARLY NEW LISTINGS ENGINE ---
-async def new_tokens_stream_loop(app):
-    logger.info("🌱 NEW EARLY LISTINGS ENGINE STARTED...")
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                res = await client.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=10.0)
-                if res.status_code == 200:
-                    items = res.json()
-                    candidate_addrs = [item.get("tokenAddress") for item in items[:30] if item.get("tokenAddress")]
-                    unseen_addrs = [a for a in candidate_addrs if a.lower() not in alerted_tokens]
+                            for pair in pairs:
+                                token_addr = normalize_address(pair.get("baseToken", {}).get("address", ""))
+                                chain = pair.get("chainId", "")
+                                vol_5m = float(pair.get("volume", {}).get("m5", 0))
+                                mcap = float(pair.get("fdv", pair.get("marketCap", 0)))
 
-                    if unseen_addrs:
-                        data_map = await fetch_batch_dex_data(client, unseen_addrs)
-                        for raw_addr in unseen_addrs:
-                            addr_key = raw_addr.lower()
-                            data = data_map.get(addr_key)
-                            
-                            if data and (data['mcap'] >= EARLY_MIN_MARKET_CAP and 
-                                        data['liquidity'] >= EARLY_MIN_LIQUIDITY and 
-                                        data['vol_5m'] >= EARLY_MIN_5M_VOLUME and 
-                                        data['buy_ratio'] >= MIN_BUY_RATIO):
-                                
-                                alerted_tokens.add(addr_key)
-                                save_alerted_tokens(alerted_tokens)
-                                await dispatch_telegram_alert(app, raw_addr, data, tag="EARLY NEW TOKEN SPIKE")
-            except Exception as e:
-                logger.error(f"Error in new tokens loop: {e}")
-            await asyncio.sleep(25)
+                                # Append snapshot history
+                                history = PRICE_HISTORY[token_addr]
+                                history.append((now, vol_5m, mcap))
 
-# --- 3. TOP DEX BOOSTS ENGINE ---
-async def boosted_stream_loop(app):
-    logger.info("⚡ TOP DEX BOOSTS ENGINE STARTED...")
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                res = await client.get("https://api.dexscreener.com/token-boosts/top/v1", timeout=10.0)
-                if res.status_code == 200:
-                    items = res.json()
-                    items_list = items.get("data", items) if isinstance(items, dict) else items
-                    if isinstance(items_list, list):
-                        candidate_addrs = [i.get("tokenAddress") for i in items_list[:20] if i.get("tokenAddress")]
-                        unseen_addrs = [a for a in candidate_addrs if a.lower() not in alerted_tokens]
+                                if len(history) < 2 or vol_5m < MIN_5M_VOLUME:
+                                    continue
 
-                        if unseen_addrs:
-                            data_map = await fetch_batch_dex_data(client, unseen_addrs)
-                            for raw_addr in unseen_addrs:
-                                addr_key = raw_addr.lower()
-                                data = data_map.get(addr_key)
-                                if data and (data['mcap'] >= EARLY_MIN_MARKET_CAP and 
-                                            data['liquidity'] >= EARLY_MIN_LIQUIDITY and 
-                                            data['vol_5m'] >= EARLY_MIN_5M_VOLUME and 
-                                            data['buy_ratio'] >= MIN_BUY_RATIO):
-                                    
-                                    alerted_tokens.add(addr_key)
-                                    save_alerted_tokens(alerted_tokens)
-                                    await dispatch_telegram_alert(app, raw_addr, data, tag="BOOSTED BREAKOUT")
-            except Exception as e:
-                logger.error(f"Error in boost loop: {e}")
-            await asyncio.sleep(20)
+                                # Calculate delta from 5m rolling window baseline
+                                base_time, base_vol, base_mcap = history[0]
+                                vol_growth = ((vol_5m - base_vol) / max(base_vol, 1.0)) * 100.0
+                                mcap_growth = ((mcap - base_mcap) / max(base_mcap, 1.0)) * 100.0
 
-# --- TELEGRAM COMMAND HANDLERS ---
+                                # Alert Triggering Condition
+                                if vol_growth >= MIN_5M_VOL_EXPANSION and mcap_growth >= MIN_5M_MCAP_EXPANSION:
+                                    alert_key = f"{token_addr}_{int(now // 300)}"  # Max 1 alert per 5m window per token
+                                    if alert_key not in SEEN_TOKENS:
+                                        sec_status = await check_goplus_security(session, chain, token_addr)
+                                        if sec_status != "UNSAFE":
+                                            await dispatch_telegram_alert(app, pair, sec_status, vol_growth, mcap_growth)
+                                            SEEN_TOKENS.add(alert_key)
+                                            await save_state_async()
+
+                except Exception as e:
+                    logging.error(f"Error in scanning cycle: {e}")
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+# ==========================================
+# COMMAND HANDLERS
+# ==========================================
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("⚠️ Usage: `/add SYMBOL CONTRACT_ADDRESS`", parse_mode="Markdown")
+    """Adds a token address to the watchlist (Restricted to Admins)."""
+    if update.effective_user.id not in ADMIN_USER_IDS:
         return
-    
-    symbol = context.args[0].upper()
-    address = context.args[1].strip()
-    
-    watchlist_tokens[symbol] = address
-    save_watchlist(watchlist_tokens)
-    await update.message.reply_text(f"✅ Added **${symbol}** to Watchlist:\n`{address}`", parse_mode="Markdown")
+
+    if not context.args:
+        await update.message.reply_text("Usage: /add <TOKEN_ADDRESS>")
+        return
+
+    addr = normalize_address(context.args[0])
+    WATCHLIST.add(addr)
+    await save_state_async()
+    await update.message.reply_text(f"✅ Added to scanner: <code>{addr}</code>", parse_mode="HTML")
 
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Removes a token address from the watchlist (Restricted to Admins)."""
+    if update.effective_user.id not in ADMIN_USER_IDS:
+        return
+
     if not context.args:
-        await update.message.reply_text("⚠️ Usage: `/remove SYMBOL`", parse_mode="Markdown")
-        return
-    
-    symbol = context.args[0].upper()
-    if symbol in watchlist_tokens:
-        del watchlist_tokens[symbol]
-        save_watchlist(watchlist_tokens)
-        await update.message.reply_text(f"❌ Removed **${symbol}** from Watchlist.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text(f"⚠️ **${symbol}** not found in Watchlist.", parse_mode="Markdown")
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not watchlist_tokens:
-        await update.message.reply_text("Watchlist is currently empty.")
-        return
-    
-    lines = [f"• **${sym}**: `{addr[:8]}...{addr[-6:]}`" for sym, addr in watchlist_tokens.items()]
-    msg = "📋 **ACTIVE WATCHLIST TOKENS:**\n\n" + "\n".join(lines)
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def handle_address_paste(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if len(text) < 30 or len(text) > 50 or " " in text:
+        await update.message.reply_text("Usage: /remove <TOKEN_ADDRESS>")
         return
 
-    await update.message.reply_text("🔎 Fetching DexScreener metrics...")
-    async with httpx.AsyncClient() as client:
-        data_map = await fetch_batch_dex_data(client, [text])
+    addr = normalize_address(context.args[0])
+    WATCHLIST.discard(addr)
+    await save_state_async()
+    await update.message.reply_text(f"❌ Removed from scanner: <code>{addr}</code>", parse_mode="HTML")
 
-    data = data_map.get(text.lower())
-    if not data:
-        await update.message.reply_text("❌ Token not found or no active liquidity pairs.")
-        return
-
-    await dispatch_telegram_alert(context.application, text, data, tag="MANUAL LOOKUP")
-
-# --- MAIN RUNNER ---
+# ==========================================
+# MAIN EXECUTION ENTRYPOINT
+# ==========================================
 async def main():
-    threading.Thread(target=run_web_server, daemon=True).start()
+    await load_state_async()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
-    app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address_paste))
 
+    # Initialize bot and launch market scanner loop concurrently
     await app.initialize()
-    await app.bot.delete_webhook(drop_pending_updates=True)
     await app.start()
+    await app.updater.start_polling()
 
-    # Concurrent Execution
-    asyncio.create_task(big_coins_stream_loop(app))
-    asyncio.create_task(new_tokens_stream_loop(app))
-    asyncio.create_task(boosted_stream_loop(app))
-
-    await app.updater.start_polling(drop_pending_updates=True)
-    await asyncio.Event().wait()
+    logging.info("Meme Coin Alert Bot initiated successfully.")
+    await monitor_market(app)
 
 if __name__ == "__main__":
     asyncio.run(main())
