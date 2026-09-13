@@ -15,37 +15,31 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
-# Securely load credentials from environment variables (falls back to provided defaults if missing)
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8804502384:AAHYjDaiM_sj7p3t1MRCSKJA5XMoUmqWINo")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5642314005")
 ADMIN_USER_IDS = [int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "5642314005").split(",")]
 
 DEXSCREENER_BATCH_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
+DEXSCREENER_LATEST_PROFILES = "https://api.dexscreener.com/token-profiles/latest/v1"
 GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{}"
 GOPLUS_SOLANA_URL = "https://api.gopluslabs.io/api/v1/solana/token_security"
 
-# Mapping chain names from DEXScreener to GoPlus Chain IDs
 EVM_CHAIN_MAP = {
-    "ethereum": "1",
-    "eth": "1",
-    "bsc": "56",
-    "polygon": "137",
-    "arbitrum": "42161",
-    "optimism": "10",
-    "avalanche": "43114",
-    "base": "8453",
-    "zksync": "324",
-    "linea": "59144"
+    "ethereum": "1", "eth": "1", "bsc": "56", "polygon": "137",
+    "arbitrum": "42161", "optimism": "10", "avalanche": "43114",
+    "base": "8453", "zksync": "324", "linea": "59144"
 }
 
-POLL_INTERVAL = 10  # Seconds between market scans
-SNAPSHOT_WINDOW = 300  # 5-minute rolling window
+POLL_INTERVAL = 10     # Seconds between market scans
 MAX_SEEN_CACHE = 2000
 
-# Criteria Thresholds
-MIN_5M_VOL_EXPANSION = 25.0   # % growth in 5m
-MIN_5M_MCAP_EXPANSION = 15.0  # % growth in 5m
-MIN_5M_VOLUME = 15000.0       # Minimum $ volume in 5m
+# ==========================================
+# CRITERIA THRESHOLDS (LOWERED FOR TESTING)
+# ==========================================
+# Adjust these values back up once you verify alerts are working!
+MIN_5M_VOL_EXPANSION = 0.5   # % growth in 5m (Default production: 25.0)
+MIN_5M_MCAP_EXPANSION = 0.5  # % growth in 5m (Default production: 15.0)
+MIN_5M_VOLUME = 100.0       # Minimum $ volume in 5m (Default production: 15000.0)
 
 # ==========================================
 # STATE & CACHE MANAGEMENT
@@ -147,6 +141,7 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_status:
         f"<a href='{dex_url}'>📈 View on DEXScreener</a>"
     )
 
+    logging.info(f"Sending Telegram Alert for {symbol} ({address})...")
     await app.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
         text=msg,
@@ -161,6 +156,18 @@ async def monitor_market(app: Application):
             async with STATE_LOCK:
                 current_watchlist = list(WATCHLIST)
 
+            # Auto-fallback to public latest token discovery if watchlist is empty
+            if not current_watchlist:
+                logging.info("Watchlist empty. Fetching latest public tokens for testing...")
+                try:
+                    async with session.get(DEXSCREENER_LATEST_PROFILES, timeout=8) as resp:
+                        if resp.status == 200:
+                            profiles = await resp.json()
+                            if isinstance(profiles, list):
+                                current_watchlist = [p.get("tokenAddress") for p in profiles[:10] if p.get("tokenAddress")]
+                except Exception as e:
+                    logging.error(f"Error fetching fallback tokens: {e}")
+
             if current_watchlist:
                 addresses = ",".join(current_watchlist[:30])
                 try:
@@ -169,6 +176,8 @@ async def monitor_market(app: Application):
                             data = await resp.json()
                             pairs = data.get("pairs", [])
                             now = datetime.now().timestamp()
+
+                            logging.info(f"Scanning {len(pairs)} active trading pair(s)...")
 
                             for pair in pairs:
                                 token_addr = normalize_address(pair.get("baseToken", {}).get("address", ""))
@@ -179,14 +188,20 @@ async def monitor_market(app: Application):
                                 history = PRICE_HISTORY[token_addr]
                                 history.append((now, vol_5m, mcap))
 
-                                if len(history) < 2 or vol_5m < MIN_5M_VOLUME:
+                                if len(history) < 2:
+                                    logging.info(f"Building snapshot history for {token_addr} (Cycle 1/2)")
                                     continue
 
                                 base_time, base_vol, base_mcap = history[0]
                                 vol_growth = ((vol_5m - base_vol) / max(base_vol, 1.0)) * 100.0
                                 mcap_growth = ((mcap - base_mcap) / max(base_mcap, 1.0)) * 100.0
 
-                                if vol_growth >= MIN_5M_VOL_EXPANSION and mcap_growth >= MIN_5M_MCAP_EXPANSION:
+                                logging.info(
+                                    f"[{token_addr[:8]}...] Vol: ${vol_5m:,.0f} (Growth: {vol_growth:+.2f}%) | "
+                                    f"MCap: ${mcap:,.0f} (Growth: {mcap_growth:+.2f}%)"
+                                )
+
+                                if vol_5m >= MIN_5M_VOLUME and vol_growth >= MIN_5M_VOL_EXPANSION and mcap_growth >= MIN_5M_MCAP_EXPANSION:
                                     alert_key = f"{token_addr}_{int(now // 300)}"
                                     
                                     async with STATE_LOCK:
@@ -224,7 +239,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Added to scanner: <code>{addr}</code>", parse_mode="HTML")
 
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Removes a token address from the watchlist (Restricted to Admins)."""
+    """Removes a token address to the watchlist (Restricted to Admins)."""
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
 
