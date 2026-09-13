@@ -13,31 +13,47 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
-TELEGRAM_BOT_TOKEN = "8804502384:AAHYjDaiM_sj7p3t1MRCSKJA5XMoUmqWINo"
-TELEGRAM_CHAT_ID = "5642314005"
-ADMIN_USER_IDS = [5642314005]  # Restricts /add and /remove commands to you
+# Securely load credentials from environment variables (falls back to provided defaults if missing)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8804502384:AAHYjDaiM_sj7p3t1MRCSKJA5XMoUmqWINo")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5642314005")
+ADMIN_USER_IDS = [int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "5642314005").split(",")]
 
 DEXSCREENER_BATCH_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{}"
 GOPLUS_SOLANA_URL = "https://api.gopluslabs.io/api/v1/solana/token_security"
 
+# Mapping chain names from DEXScreener to GoPlus Chain IDs
+EVM_CHAIN_MAP = {
+    "ethereum": "1",
+    "eth": "1",
+    "bsc": "56",
+    "polygon": "137",
+    "arbitrum": "42161",
+    "optimism": "10",
+    "avalanche": "43114",
+    "base": "8453",
+    "zksync": "324",
+    "linea": "59144"
+}
+
 POLL_INTERVAL = 10  # Seconds between market scans
-SNAPSHOT_WINDOW = 300  # 5-minute rolling window for expansion math
+SNAPSHOT_WINDOW = 300  # 5-minute rolling window
 MAX_SEEN_CACHE = 2000
 
 # Criteria Thresholds
-MIN_5M_VOL_EXPANSION = 25.0  # % growth in 5m
-MIN_5M_MCAP_EXPANSION = 15.0 # % growth in 5m
-MIN_5M_VOLUME = 15000.0      # Minimum $ volume in 5m
+MIN_5M_VOL_EXPANSION = 25.0   # % growth in 5m
+MIN_5M_MCAP_EXPANSION = 15.0  # % growth in 5m
+MIN_5M_VOLUME = 15000.0       # Minimum $ volume in 5m
 
 # ==========================================
 # STATE & CACHE MANAGEMENT
 # ==========================================
 WATCHLIST = set()
 SEEN_TOKENS = set()
-PRICE_HISTORY = defaultdict(lambda: deque(maxlen=30))  # 5-minute sliding snapshot
+PRICE_HISTORY = defaultdict(lambda: deque(maxlen=30))
+STATE_LOCK = asyncio.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -48,32 +64,35 @@ def normalize_address(address: str) -> str:
     return address.strip()
 
 async def save_state_async():
-    """Non-blocking asynchronous file state persistence."""
-    data = {
-        "watchlist": list(WATCHLIST),
-        "seen_tokens": list(SEEN_TOKENS)[-MAX_SEEN_CACHE:]
-    }
-    await asyncio.to_thread(lambda: open("bot_state.json", "w").write(json.dumps(data, indent=2)))
+    """Thread-safe non-blocking state persistence."""
+    async with STATE_LOCK:
+        data = {
+            "watchlist": list(WATCHLIST),
+            "seen_tokens": list(SEEN_TOKENS)[-MAX_SEEN_CACHE:]
+        }
+        await asyncio.to_thread(lambda: open("bot_state.json", "w").write(json.dumps(data, indent=2)))
 
 async def load_state_async():
-    """Loads state from file if available."""
+    """Loads state from persistent storage."""
     global WATCHLIST, SEEN_TOKENS
-    try:
-        content = await asyncio.to_thread(lambda: open("bot_state.json", "r").read())
-        data = json.loads(content)
-        WATCHLIST = set(data.get("watchlist", []))
-        SEEN_TOKENS = set(data.get("seen_tokens", []))
-    except FileNotFoundError:
-        WATCHLIST = set()
-        SEEN_TOKENS = set()
+    async with STATE_LOCK:
+        try:
+            content = await asyncio.to_thread(lambda: open("bot_state.json", "r").read())
+            data = json.loads(content)
+            WATCHLIST = set(data.get("watchlist", []))
+            SEEN_TOKENS = set(data.get("seen_tokens", []))
+        except FileNotFoundError:
+            WATCHLIST = set()
+            SEEN_TOKENS = set()
 
 # ==========================================
 # SECURITY AUDIT ENGINE (GOPLUS)
 # ==========================================
 async def check_goplus_security(session: aiohttp.ClientSession, chain: str, token_address: str) -> str:
-    """Verifies token safety returning SAFE, UNSAFE, or UNVERIFIED."""
+    """Verifies token safety across supported EVM and Solana chains."""
+    chain_lower = chain.lower()
     try:
-        if chain.lower() in ["solana", "sol"]:
+        if chain_lower in ["solana", "sol"]:
             async with session.get(GOPLUS_SOLANA_URL, params={"contract_addresses": [token_address]}, timeout=8) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -82,8 +101,10 @@ async def check_goplus_security(session: aiohttp.ClientSession, chain: str, toke
                         return "UNSAFE"
                     return "SAFE"
         else:
-            # Assumes EVM chain mapping (eth, base, bsc, arbitrum, etc.)
-            chain_id = "1" if chain.lower() in ["ethereum", "eth"] else "8453"  # Default Base (8453)
+            chain_id = EVM_CHAIN_MAP.get(chain_lower)
+            if not chain_id:
+                return "UNVERIFIED"
+
             url = GOPLUS_EVM_URL.format(chain_id)
             async with session.get(url, params={"contract_addresses": token_address}, timeout=8) as resp:
                 if resp.status == 200:
@@ -93,14 +114,14 @@ async def check_goplus_security(session: aiohttp.ClientSession, chain: str, toke
                         return "UNSAFE"
                     return "SAFE"
     except Exception as e:
-        logging.error(f"GoPlus check error for {token_address}: {e}")
+        logging.error(f"GoPlus security audit error for {token_address} on {chain}: {e}")
     return "UNVERIFIED"
 
 # ==========================================
 # MARKET TRACKING & TELEGRAM DISPATCH
 # ==========================================
 async def dispatch_telegram_alert(app: Application, pair: dict, security_status: str, vol_growth: float, mcap_growth: float):
-    """Formats cleanly using HTML escape mode to eliminate rendering failures."""
+    """Formats cleanly using HTML escape mode."""
     base_token = pair.get("baseToken", {})
     name = html.escape(base_token.get("name", "Unknown"))
     symbol = html.escape(base_token.get("symbol", "UNKNOWN"))
@@ -112,7 +133,7 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_status:
     vol_5m = float(pair.get("volume", {}).get("m5", 0))
     dex_url = pair.get("url", "")
 
-    sec_badge = "🟢 SAFE" if security_status == "SAFE" else "🟡 UNVERIFIED"
+    sec_badge = "🟢 SAFE" if security_status == "SAFE" else ("🔴 UNSAFE" if security_status == "UNSAFE" else "🟡 UNVERIFIED")
     
     msg = (
         f"<b>🚨 ACCELERATION ALERT: {symbol}</b>\n\n"
@@ -134,11 +155,14 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_status:
     )
 
 async def monitor_market(app: Application):
-    """Main scanning loop monitoring real expansion metrics using rolling windows."""
+    """Main market scanner loop using sliding snapshot windows."""
     async with aiohttp.ClientSession() as session:
         while True:
-            if WATCHLIST:
-                addresses = ",".join(list(WATCHLIST)[:30])
+            async with STATE_LOCK:
+                current_watchlist = list(WATCHLIST)
+
+            if current_watchlist:
+                addresses = ",".join(current_watchlist[:30])
                 try:
                     async with session.get(DEXSCREENER_BATCH_URL.format(addresses), timeout=10) as resp:
                         if resp.status == 200:
@@ -152,30 +176,32 @@ async def monitor_market(app: Application):
                                 vol_5m = float(pair.get("volume", {}).get("m5", 0))
                                 mcap = float(pair.get("fdv", pair.get("marketCap", 0)))
 
-                                # Append snapshot history
                                 history = PRICE_HISTORY[token_addr]
                                 history.append((now, vol_5m, mcap))
 
                                 if len(history) < 2 or vol_5m < MIN_5M_VOLUME:
                                     continue
 
-                                # Calculate delta from 5m rolling window baseline
                                 base_time, base_vol, base_mcap = history[0]
                                 vol_growth = ((vol_5m - base_vol) / max(base_vol, 1.0)) * 100.0
                                 mcap_growth = ((mcap - base_mcap) / max(base_mcap, 1.0)) * 100.0
 
-                                # Alert Triggering Condition
                                 if vol_growth >= MIN_5M_VOL_EXPANSION and mcap_growth >= MIN_5M_MCAP_EXPANSION:
-                                    alert_key = f"{token_addr}_{int(now // 300)}"  # Max 1 alert per 5m window per token
-                                    if alert_key not in SEEN_TOKENS:
+                                    alert_key = f"{token_addr}_{int(now // 300)}"
+                                    
+                                    async with STATE_LOCK:
+                                        already_seen = alert_key in SEEN_TOKENS
+
+                                    if not already_seen:
                                         sec_status = await check_goplus_security(session, chain, token_addr)
                                         if sec_status != "UNSAFE":
                                             await dispatch_telegram_alert(app, pair, sec_status, vol_growth, mcap_growth)
-                                            SEEN_TOKENS.add(alert_key)
+                                            async with STATE_LOCK:
+                                                SEEN_TOKENS.add(alert_key)
                                             await save_state_async()
 
                 except Exception as e:
-                    logging.error(f"Error in scanning cycle: {e}")
+                    logging.error(f"Error in market scan loop: {e}")
 
             await asyncio.sleep(POLL_INTERVAL)
 
@@ -192,7 +218,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     addr = normalize_address(context.args[0])
-    WATCHLIST.add(addr)
+    async with STATE_LOCK:
+        WATCHLIST.add(addr)
     await save_state_async()
     await update.message.reply_text(f"✅ Added to scanner: <code>{addr}</code>", parse_mode="HTML")
 
@@ -206,7 +233,8 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     addr = normalize_address(context.args[0])
-    WATCHLIST.discard(addr)
+    async with STATE_LOCK:
+        WATCHLIST.discard(addr)
     await save_state_async()
     await update.message.reply_text(f"❌ Removed from scanner: <code>{addr}</code>", parse_mode="HTML")
 
@@ -217,7 +245,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running")
+        self.wfile.write(b"OK")
 
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
@@ -234,7 +262,6 @@ async def main():
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
 
-    # Initialize bot and launch market scanner loop concurrently
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
@@ -243,8 +270,5 @@ async def main():
     await monitor_market(app)
 
 if __name__ == "__main__":
-    # Start web server on background thread for Render HTTP checks
     threading.Thread(target=run_health_check_server, daemon=True).start()
-    
-    # Run main Telegram bot loop
     asyncio.run(main())
