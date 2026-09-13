@@ -1,8 +1,11 @@
+import os
 import asyncio
 import json
 import logging
 import re
 import html
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque, defaultdict
 from datetime import datetime
 import aiohttp
@@ -208,6 +211,20 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"❌ Removed from scanner: <code>{addr}</code>", parse_mode="HTML")
 
 # ==========================================
+# RENDER FREE SERVICE HEALTH SERVER
+# ==========================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+
+def run_health_check_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# ==========================================
 # MAIN EXECUTION ENTRYPOINT
 # ==========================================
 async def main():
@@ -226,4 +243,8 @@ async def main():
     await monitor_market(app)
 
 if __name__ == "__main__":
+    # Start web server on background thread for Render HTTP checks
+    threading.Thread(target=run_health_check_server, daemon=True).start()
+    
+    # Run main Telegram bot loop
     asyncio.run(main())
