@@ -9,20 +9,19 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque, defaultdict
 from datetime import datetime
 import aiohttp
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-ADMIN_USER_IDS = [int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "YOUR_CHAT_ID").split(",") if uid.isdigit()]
+CRYPTOPANIC_API_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "") # Optional for extended news feed
 
-# J7Tracker & Market API Endpoints
-J7_WEBSOCKET_URL = os.environ.get("J7_WEBSOCKET_URL", "wss://api.j7tracker.io/v1/feed") # Example J7 feed URL
 DEXSCREENER_BATCH_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 DEXSCREENER_BOOSTED_TOP = "https://api.dexscreener.com/token-boosts/top/v1"
+DEXSCREENER_NEW_PROFILES = "https://api.dexscreener.com/token-profiles/latest/v1"
 GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{}"
 GOPLUS_SOLANA_URL = "https://api.gopluslabs.io/api/v1/solana/token_security"
 
@@ -33,11 +32,6 @@ EVM_CHAIN_MAP = {
 }
 
 POLL_INTERVAL = 10     # Seconds between scans
-MAX_SEEN_CACHE = 2000
-
-# ==========================================
-# DIRECTIONAL SENSITIVITY THRESHOLDS
-# ==========================================
 PUMP_5M_MIN = 5.0      # +5.0% change triggers a PUMP alert
 DUMP_5M_MIN = -5.0     # -5.0% change triggers a DUMP alert
 MIN_5M_VOLUME = 5000.0 # Minimum volume filter ($)
@@ -48,13 +42,12 @@ MIN_5M_VOLUME = 5000.0 # Minimum volume filter ($)
 WATCHLIST = set()
 SEEN_TOKENS = set()
 PRICE_HISTORY = defaultdict(lambda: deque(maxlen=30))
-SOCIAL_MENTIONS = defaultdict(list) # Stores recent tweets from J7Tracker
+SOCIAL_MENTIONS = defaultdict(list)
 STATE_LOCK = asyncio.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 def normalize_address(address: str) -> str:
-    """Preserves Solana Base58 casing while lowercasing EVM addresses."""
     if re.match(r"^0x[a-fA-F0-9]{40}$", address):
         return address.lower()
     return address.strip()
@@ -64,13 +57,7 @@ def normalize_address(address: str) -> str:
 # ==========================================
 async def check_goplus_security(session: aiohttp.ClientSession, chain: str, token_address: str) -> dict:
     chain_lower = chain.lower()
-    audit = {
-        "status": "UNVERIFIED",
-        "dev_pct": "N/A",
-        "is_mintable": "No",
-        "is_freezable": "No",
-        "lp_status": "Unknown"
-    }
+    audit = {"status": "UNVERIFIED", "dev_pct": "N/A", "is_mintable": "No", "is_freezable": "No", "lp_status": "Unknown"}
     try:
         if chain_lower in ["solana", "sol"]:
             async with session.get(GOPLUS_SOLANA_URL, params={"contract_addresses": [token_address]}, timeout=8) as resp:
@@ -109,11 +96,11 @@ async def check_goplus_security(session: aiohttp.ClientSession, chain: str, toke
                         elif res.get("lp_holder_count"):
                             audit["lp_status"] = "🔒 Active Pool"
     except Exception as e:
-        logging.error(f"GoPlus Security Check Error: {e}")
+        logging.error(f"GoPlus Security Error: {e}")
     return audit
 
 # ==========================================
-# ALERT DISPATCH ENGINE
+# ALERT DISPATCH ENGINE WITH INLINE BUTTONS
 # ==========================================
 async def dispatch_telegram_alert(app: Application, pair: dict, security_info: dict, mcap_change: float, alert_type: str):
     base_token = pair.get("baseToken", {})
@@ -127,11 +114,9 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
     vol_5m = float(pair.get("volume", {}).get("m5", 0))
     dex_url = pair.get("url", "")
 
-    # Retrieve J7 tracker tweets linked to this CA
     recent_tweets = SOCIAL_MENTIONS.get(address, [])
-    social_text = "No recent J7 Twitter signals" if not recent_tweets else f"💬 {recent_tweets[-1]}"
+    social_text = "No recent viral tweets" if not recent_tweets else f"💬 {recent_tweets[-1]}"
 
-    # Setup Directional Banner
     if alert_type == "BULLISH_PUMP":
         header = f"🚀 <b>BULLISH PUMP DETECTED (+{mcap_change:.1f}%)</b>"
         action = "🟢 ACCORDING TO SYSTEM: ACCEPT / BULLISH ENTRY"
@@ -153,7 +138,7 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
         f"<b>Market Cap:</b> ${mcap:,.0f} (<b>{mcap_change:+.1f}%</b> in 5m)\n"
         f"<b>5m Volume:</b> ${vol_5m:,.0f}\n"
         f"<b>Current Price:</b> ${price_usd:.8f}\n\n"
-        f"<b>🐦 J7 TRACKER / X (TWITTER) SIGNALS</b>\n"
+        f"<b>🐦 HIGH IMPACT NEWS & X (TWITTER) SIGNALS</b>\n"
         f"<code>{html.escape(social_text)}</code>\n\n"
         f"<b>🕵️ INSIDER DATA</b>\n"
         f"<b>Dev Holdings:</b> {security_info.get('dev_pct')}\n"
@@ -166,41 +151,85 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
         f"<a href='{dex_url}'>📈 View Chart on DEXScreener</a>"
     )
 
+    # CREATING INLINE BUTTONS
+    keyboard = [
+        [
+            InlineKeyboardButton("🟢 Accept / Long", callback_data=f"accept_{address[:10]}"),
+            InlineKeyboardButton("🔴 Decline / Skip", callback_data=f"decline_{address[:10]}")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     try:
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=msg,
             parse_mode="HTML",
+            reply_markup=reply_markup,
             disable_web_page_preview=True
         )
     except Exception as e:
-        logging.error(f"Failed to dispatch alert: {e}")
+        logging.error(f"Failed to send alert: {e}")
 
 # ==========================================
-# J7 TRACKER INGESTION WORKER
+# TELEGRAM BUTTON CLICK HANDLER
 # ==========================================
-async def listen_j7_tracker_ws():
-    """Background task connecting to J7Tracker streams to capture early tweets."""
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.ws_connect(J7_WEBSOCKET_URL, timeout=10) as ws:
-                    logging.info("Connected to J7 Tracker WebSocket feed.")
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            payload = json.loads(msg.data)
-                            # Parse out tweet text & extracted contract addresses
-                            tweet_text = payload.get("tweet_text", "")
-                            ca = payload.get("contract_address")
-                            if ca:
-                                normalized_ca = normalize_address(ca)
-                                SOCIAL_MENTIONS[normalized_ca].append(f"@{payload.get('author')}: {tweet_text[:100]}...")
-                                # Automatically flag contract into scanner watchlist
-                                async with STATE_LOCK:
-                                    WATCHLIST.add(normalized_ca)
-        except Exception as e:
-            logging.warning(f"J7 Tracker socket retry in 15s: {e}")
-            await asyncio.sleep(15)
+async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    user = query.from_user.first_name
+
+    if data.startswith("accept_"):
+        status_text = f"\n\n<b>✅ VERDICT BY {user.upper()}: ACCEPTED / TRADE LOGGED</b>"
+    elif data.startswith("decline_"):
+        status_text = f"\n\n<b>❌ VERDICT BY {user.upper()}: DECLINED / SKIPPED</b>"
+    else:
+        return
+
+    # Update original message to remove buttons and stamp choice
+    new_text = query.message.text + status_text
+    try:
+        await query.edit_message_text(text=new_text, parse_mode="HTML", reply_markup=None)
+    except Exception as e:
+        logging.error(f"Failed to update message button state: {e}")
+
+# ==========================================
+# NEW LAUNCHES & INFLUENTIAL TWEET MONITORING
+# ==========================================
+async def fetch_new_token_launches(session: aiohttp.ClientSession):
+    """Monitors DexScreener for newly launched token profiles."""
+    try:
+        async with session.get(DEXSCREENER_NEW_PROFILES, timeout=8) as resp:
+            if resp.status == 200:
+                profiles = await resp.json()
+                if isinstance(profiles, list):
+                    for prof in profiles[:10]:
+                        ca = prof.get("tokenAddress")
+                        if ca:
+                            norm_ca = normalize_address(ca)
+                            async with STATE_LOCK:
+                                WATCHLIST.add(norm_ca)
+    except Exception as e:
+        logging.error(f"Error fetching new launches: {e}")
+
+async def fetch_crypto_news_and_influencers(session: aiohttp.ClientSession):
+    """Polls crypto news feeds for breaking tweets, influencer news, or viral token tags."""
+    try:
+        url = "https://cryptopanic.com/api/v1/posts/?auth_token=" + CRYPTOPANIC_API_KEY if CRYPTOPANIC_API_KEY else "https://cryptopanic.com/api/v1/posts/?public=true"
+        async with session.get(url, timeout=8) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for post in data.get("results", [])[:5]:
+                    title = post.get("title", "")
+                    currencies = post.get("currencies", [])
+                    for c in currencies:
+                        code = c.get("code")
+                        if code:
+                            SOCIAL_MENTIONS[code].append(title)
+    except Exception as e:
+        logging.error(f"Error fetching crypto news: {e}")
 
 # ==========================================
 # MAIN SCANNING LOOP
@@ -208,6 +237,10 @@ async def listen_j7_tracker_ws():
 async def monitor_market(app: Application):
     async with aiohttp.ClientSession() as session:
         while True:
+            # Poll newly launched tokens and high impact news
+            await fetch_new_token_launches(session)
+            await fetch_crypto_news_and_influencers(session)
+
             async with STATE_LOCK:
                 current_watchlist = list(WATCHLIST)
 
@@ -249,7 +282,6 @@ async def monitor_market(app: Application):
                                 base_time, base_vol, base_mcap = history[0]
                                 mcap_growth = ((mcap - base_mcap) / max(base_mcap, 1.0)) * 100.0
 
-                                # Check Directional Trigger Criteria
                                 is_pump = mcap_growth >= PUMP_5M_MIN and vol_5m >= MIN_5M_VOLUME
                                 is_dump = mcap_growth <= DUMP_5M_MIN and vol_5m >= MIN_5M_VOLUME
 
@@ -266,7 +298,7 @@ async def monitor_market(app: Application):
                                             async with STATE_LOCK:
                                                 SEEN_TOKENS.add(alert_key)
                 except Exception as e:
-                    logging.error(f"Market monitor cycle error: {e}")
+                    logging.error(f"Market monitor error: {e}")
 
             await asyncio.sleep(POLL_INTERVAL)
 
@@ -286,14 +318,15 @@ def run_health_check_server():
 
 async def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Register callback query handler for Accept / Decline inline buttons
+    app.add_handler(CallbackQueryHandler(handle_button_click))
+
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
-    # Start background tasks
-    asyncio.create_task(listen_j7_tracker_ws())
-    
-    logging.info("Bot operational with J7 Tracker Ingestion & Directional Pump/Dump Monitoring.")
+    logging.info("Bot operational with Inline Buttons, News Feed Ingestion, and New Launch Tracking.")
     await monitor_market(app)
 
 if __name__ == "__main__":
