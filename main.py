@@ -15,10 +15,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8804502384:AAHYjDaiM_sj7p3t1MRCSKJA5XMoUmqWINo")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5642314005")
-ADMIN_USER_IDS = [int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "5642314005").split(",") if uid.isdigit()]
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+ADMIN_USER_IDS = [int(uid) for uid in os.environ.get("ADMIN_USER_IDS", "YOUR_CHAT_ID").split(",") if uid.isdigit()]
 
+# J7Tracker & Market API Endpoints
+J7_WEBSOCKET_URL = os.environ.get("J7_WEBSOCKET_URL", "wss://api.j7tracker.io/v1/feed") # Example J7 feed URL
 DEXSCREENER_BATCH_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 DEXSCREENER_BOOSTED_TOP = "https://api.dexscreener.com/token-boosts/top/v1"
 GOPLUS_EVM_URL = "https://api.gopluslabs.io/api/v1/token_security/{}"
@@ -30,15 +32,15 @@ EVM_CHAIN_MAP = {
     "base": "8453", "zksync": "324", "linea": "59144"
 }
 
-POLL_INTERVAL = 10     # Seconds between market scans
+POLL_INTERVAL = 10     # Seconds between scans
 MAX_SEEN_CACHE = 2000
 
 # ==========================================
-# CRITERIA THRESHOLDS
+# DIRECTIONAL SENSITIVITY THRESHOLDS
 # ==========================================
-MIN_5M_VOL_EXPANSION = 0.1   # % volume growth in 5m window
-MIN_5M_MCAP_EXPANSION = 0.0  # % market cap growth in 5m window
-MIN_5M_VOLUME = 10.0        # Minimum $ 5m volume threshold
+PUMP_5M_MIN = 5.0      # +5.0% change triggers a PUMP alert
+DUMP_5M_MIN = -5.0     # -5.0% change triggers a DUMP alert
+MIN_5M_VOLUME = 5000.0 # Minimum volume filter ($)
 
 # ==========================================
 # STATE & CACHE MANAGEMENT
@@ -46,6 +48,7 @@ MIN_5M_VOLUME = 10.0        # Minimum $ 5m volume threshold
 WATCHLIST = set()
 SEEN_TOKENS = set()
 PRICE_HISTORY = defaultdict(lambda: deque(maxlen=30))
+SOCIAL_MENTIONS = defaultdict(list) # Stores recent tweets from J7Tracker
 STATE_LOCK = asyncio.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -56,33 +59,10 @@ def normalize_address(address: str) -> str:
         return address.lower()
     return address.strip()
 
-async def save_state_async():
-    """Thread-safe state persistence."""
-    async with STATE_LOCK:
-        data = {
-            "watchlist": list(WATCHLIST),
-            "seen_tokens": list(SEEN_TOKENS)[-MAX_SEEN_CACHE:]
-        }
-        await asyncio.to_thread(lambda: open("bot_state.json", "w").write(json.dumps(data, indent=2)))
-
-async def load_state_async():
-    """Loads saved state on initialization."""
-    global WATCHLIST, SEEN_TOKENS
-    async with STATE_LOCK:
-        try:
-            content = await asyncio.to_thread(lambda: open("bot_state.json", "r").read())
-            data = json.loads(content)
-            WATCHLIST = set(data.get("watchlist", []))
-            SEEN_TOKENS = set(data.get("seen_tokens", []))
-        except FileNotFoundError:
-            WATCHLIST = set()
-            SEEN_TOKENS = set()
-
 # ==========================================
-# INSIDER SECURITY AUDIT ENGINE (GOPLUS)
+# INSIDER & SECURITY AUDIT (GOPLUS)
 # ==========================================
 async def check_goplus_security(session: aiohttp.ClientSession, chain: str, token_address: str) -> dict:
-    """Retrieves deep security flags including honeypot metrics, dev holdings, and freeze authority."""
     chain_lower = chain.lower()
     audit = {
         "status": "UNVERIFIED",
@@ -91,68 +71,51 @@ async def check_goplus_security(session: aiohttp.ClientSession, chain: str, toke
         "is_freezable": "No",
         "lp_status": "Unknown"
     }
-    
     try:
         if chain_lower in ["solana", "sol"]:
             async with session.get(GOPLUS_SOLANA_URL, params={"contract_addresses": [token_address]}, timeout=8) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     res = data.get("result", {}).get(token_address, {})
-                    
                     freezable = res.get("freezable", {}).get("status") == "1"
                     mintable = res.get("mintable", {}).get("status") == "1"
-                    
                     audit["is_freezable"] = "⚠️ YES" if freezable else "No"
                     audit["is_mintable"] = "⚠️ YES" if mintable else "No"
-                    
-                    if freezable or mintable:
-                        audit["status"] = "UNSAFE"
-                    else:
-                        audit["status"] = "SAFE"
+                    audit["status"] = "UNSAFE" if (freezable or mintable) else "SAFE"
                     
                     creator_holding = res.get("creator_percent")
                     if creator_holding is not None:
                         audit["dev_pct"] = f"{float(creator_holding) * 100:.1f}%"
         else:
             chain_id = EVM_CHAIN_MAP.get(chain_lower)
-            if not chain_id:
-                return audit
-
-            url = GOPLUS_EVM_URL.format(chain_id)
-            async with session.get(url, params={"contract_addresses": token_address}, timeout=8) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    res = data.get("result", {}).get(token_address.lower(), {})
-                    
-                    is_honeypot = res.get("is_honeypot") == "1"
-                    cannot_sell = float(res.get("cannot_sell_all", 0)) == 1
-                    
-                    if is_honeypot or cannot_sell:
-                        audit["status"] = "UNSAFE"
-                    else:
-                        audit["status"] = "SAFE"
+            if chain_id:
+                url = GOPLUS_EVM_URL.format(chain_id)
+                async with session.get(url, params={"contract_addresses": token_address}, timeout=8) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        res = data.get("result", {}).get(token_address.lower(), {})
+                        is_honeypot = res.get("is_honeypot") == "1"
+                        cannot_sell = float(res.get("cannot_sell_all", 0)) == 1
+                        audit["status"] = "UNSAFE" if (is_honeypot or cannot_sell) else "SAFE"
+                        audit["is_mintable"] = "⚠️ YES" if res.get("is_mintable") == "1" else "No"
                         
-                    audit["is_mintable"] = "⚠️ YES" if res.get("is_mintable") == "1" else "No"
-                    
-                    dev_val = res.get("creator_percent")
-                    if dev_val:
-                        audit["dev_pct"] = f"{float(dev_val) * 100:.1f}%"
-                    
-                    lp_burned = float(res.get("lp_burned_percent", 0))
-                    if lp_burned > 0.8:
-                        audit["lp_status"] = "🔥 Burned"
-                    elif res.get("lp_holder_count"):
-                        audit["lp_status"] = "🔒 Active Pool"
+                        dev_val = res.get("creator_percent")
+                        if dev_val:
+                            audit["dev_pct"] = f"{float(dev_val) * 100:.1f}%"
                         
+                        lp_burned = float(res.get("lp_burned_percent", 0))
+                        if lp_burned > 0.8:
+                            audit["lp_status"] = "🔥 Burned"
+                        elif res.get("lp_holder_count"):
+                            audit["lp_status"] = "🔒 Active Pool"
     except Exception as e:
-        logging.error(f"GoPlus error for {token_address}: {e}")
-        
+        logging.error(f"GoPlus Security Check Error: {e}")
     return audit
 
 # ==========================================
-# ALERT DISPATCHER & MONITOR LOOP
+# ALERT DISPATCH ENGINE
 # ==========================================
-async def dispatch_telegram_alert(app: Application, pair: dict, security_info: dict, vol_growth: float, mcap_growth: float):
+async def dispatch_telegram_alert(app: Application, pair: dict, security_info: dict, mcap_change: float, alert_type: str):
     base_token = pair.get("baseToken", {})
     name = html.escape(base_token.get("name", "Unknown"))
     symbol = html.escape(base_token.get("symbol", "UNKNOWN"))
@@ -164,52 +127,46 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
     vol_5m = float(pair.get("volume", {}).get("m5", 0))
     dex_url = pair.get("url", "")
 
-    status = security_info.get("status", "UNVERIFIED")
-    sec_badge = "🟢 SAFE" if status == "SAFE" else ("🔴 UNSAFE" if status == "UNSAFE" else "🟡 UNVERIFIED")
-    
-    # Calculate Dynamic Exit Targets
-    tp1 = price_usd * 1.25  # +25%
-    tp2 = price_usd * 1.50  # +50%
-    tp3 = price_usd * 2.00  # +100% (2x)
-    sl = price_usd * 0.85   # -15% Stop Loss
+    # Retrieve J7 tracker tweets linked to this CA
+    recent_tweets = SOCIAL_MENTIONS.get(address, [])
+    social_text = "No recent J7 Twitter signals" if not recent_tweets else f"💬 {recent_tweets[-1]}"
 
-    # Dynamic Strategy Setup based on Volume Profile
-    if vol_5m >= 50000:
-        hold_time = "⚡ Scalp (5 to 20 mins)"
-        entry_strategy = "Immediate market fill on 1m pullback"
-    elif vol_5m >= 10000:
-        hold_time = "🕒 Short Swing (1 to 4 hours)"
-        entry_strategy = "Limit order at 3-5% pullback zone"
+    # Setup Directional Banner
+    if alert_type == "BULLISH_PUMP":
+        header = f"🚀 <b>BULLISH PUMP DETECTED (+{mcap_change:.1f}%)</b>"
+        action = "🟢 ACCORDING TO SYSTEM: ACCEPT / BULLISH ENTRY"
+        tp1, sl = price_usd * 1.30, price_usd * 0.88
     else:
-        hold_time = "⏳ Low Volatility Watch (15m to 1 hour)"
-        entry_strategy = "Limit order at immediate micro support"
+        header = f"🚨 <b>BEARISH DUMP DETECTED ({mcap_change:.1f}%)</b>"
+        action = "🔴 ACCORDING TO SYSTEM: DECLINE / LIQUIDATE"
+        tp1, sl = price_usd * 0.70, price_usd * 1.10
+
+    sec_status = security_info.get("status", "UNVERIFIED")
+    sec_badge = "🟢 SAFE" if sec_status == "SAFE" else ("🔴 UNSAFE" if sec_status == "UNSAFE" else "🟡 UNVERIFIED")
 
     msg = (
-        f"<b>🚨 ACCELERATION ALERT: {symbol}</b>\n\n"
+        f"{header}\n\n"
         f"<b>Token:</b> {name} (${symbol})\n"
         f"<b>Chain:</b> {chain}\n"
-        f"<b>Security:</b> {sec_badge}\n\n"
-        f"<b>Market Cap:</b> ${mcap:,.0f} (<b>+{mcap_growth:.1f}%</b> in 5m)\n"
-        f"<b>5m Volume:</b> ${vol_5m:,.0f} (<b>+{vol_growth:.1f}%</b> in 5m)\n"
+        f"<b>Security:</b> {sec_badge}\n"
+        f"<b>Action Guidance:</b> <code>{action}</code>\n\n"
+        f"<b>Market Cap:</b> ${mcap:,.0f} (<b>{mcap_change:+.1f}%</b> in 5m)\n"
+        f"<b>5m Volume:</b> ${vol_5m:,.0f}\n"
         f"<b>Current Price:</b> ${price_usd:.8f}\n\n"
-        f"<b>🕵️ INSIDER DATA & AUDIT</b>\n"
+        f"<b>🐦 J7 TRACKER / X (TWITTER) SIGNALS</b>\n"
+        f"<code>{html.escape(social_text)}</code>\n\n"
+        f"<b>🕵️ INSIDER DATA</b>\n"
         f"<b>Dev Holdings:</b> {security_info.get('dev_pct')}\n"
         f"<b>Mintable:</b> {security_info.get('is_mintable')}\n"
-        f"<b>Freezable:</b> {security_info.get('is_freezable')}\n"
         f"<b>LP Status:</b> {security_info.get('lp_status')}\n\n"
         f"<b>🎯 EXECUTION SETUP</b>\n"
-        f"<b>Entry Strategy:</b> {entry_strategy}\n"
-        f"<b>Hold Duration:</b> {hold_time}\n"
-        f"<b>Target TP1 (+25%):</b> ${tp1:.8f}\n"
-        f"<b>Target TP2 (+50%):</b> ${tp2:.8f}\n"
-        f"<b>Target TP3 (+100%):</b> ${tp3:.8f}\n"
-        f"<b>Stop Loss (-15%):</b> ${sl:.8f}\n\n"
+        f"<b>Take Profit Target:</b> ${tp1:.8f}\n"
+        f"<b>Stop Loss Threshold:</b> ${sl:.8f}\n\n"
         f"<b>Contract:</b> <code>{address}</code>\n"
-        f"<a href='{dex_url}'>📈 View on DEXScreener</a>"
+        f"<a href='{dex_url}'>📈 View Chart on DEXScreener</a>"
     )
 
     try:
-        logging.info(f"DISPATCHING TELEGRAM ALERT FOR {symbol}...")
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=msg,
@@ -217,28 +174,56 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
             disable_web_page_preview=True
         )
     except Exception as e:
-        logging.error(f"Failed to send Telegram message: {e}")
+        logging.error(f"Failed to dispatch alert: {e}")
 
+# ==========================================
+# J7 TRACKER INGESTION WORKER
+# ==========================================
+async def listen_j7_tracker_ws():
+    """Background task connecting to J7Tracker streams to capture early tweets."""
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(J7_WEBSOCKET_URL, timeout=10) as ws:
+                    logging.info("Connected to J7 Tracker WebSocket feed.")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            payload = json.loads(msg.data)
+                            # Parse out tweet text & extracted contract addresses
+                            tweet_text = payload.get("tweet_text", "")
+                            ca = payload.get("contract_address")
+                            if ca:
+                                normalized_ca = normalize_address(ca)
+                                SOCIAL_MENTIONS[normalized_ca].append(f"@{payload.get('author')}: {tweet_text[:100]}...")
+                                # Automatically flag contract into scanner watchlist
+                                async with STATE_LOCK:
+                                    WATCHLIST.add(normalized_ca)
+        except Exception as e:
+            logging.warning(f"J7 Tracker socket retry in 15s: {e}")
+            await asyncio.sleep(15)
+
+# ==========================================
+# MAIN SCANNING LOOP
+# ==========================================
 async def monitor_market(app: Application):
     async with aiohttp.ClientSession() as session:
         while True:
             async with STATE_LOCK:
                 current_watchlist = list(WATCHLIST)
 
-            # High-Volume Trending Token Discovery Endpoint (Robust Parsing)
             if not current_watchlist:
                 try:
                     async with session.get(DEXSCREENER_BOOSTED_TOP, timeout=8) as resp:
                         if resp.status == 200:
-                            raw_data = await resp.json()
-                            items = raw_data if isinstance(raw_data, list) else raw_data.get("tokens", [])
+                            raw = await resp.json()
+                            items = raw if isinstance(raw, list) else raw.get("tokens", [])
                             if isinstance(items, list):
                                 current_watchlist = [
                                     item.get("tokenAddress") for item in items 
                                     if isinstance(item, dict) and item.get("tokenAddress")
                                 ][:25]
                 except Exception as e:
-                    logging.error(f"Trending discovery error: {e}")
+                    logging.error(f"Fallback fetch error: {e}")
 
             if current_watchlist:
                 addresses = ",".join(current_watchlist[:30])
@@ -249,8 +234,6 @@ async def monitor_market(app: Application):
                             pairs = data.get("pairs", [])
                             now = datetime.now().timestamp()
 
-                            logging.info(f"Processing {len(pairs)} active pairs...")
-
                             for pair in pairs:
                                 token_addr = normalize_address(pair.get("baseToken", {}).get("address", ""))
                                 chain = pair.get("chainId", "")
@@ -260,68 +243,35 @@ async def monitor_market(app: Application):
                                 history = PRICE_HISTORY[token_addr]
                                 history.append((now, vol_5m, mcap))
 
-                                # Requires 2 ticks (approx 10-20 seconds) to determine dynamic volume acceleration
                                 if len(history) < 2:
                                     continue
 
                                 base_time, base_vol, base_mcap = history[0]
-                                vol_growth = ((vol_5m - base_vol) / max(base_vol, 1.0)) * 100.0
                                 mcap_growth = ((mcap - base_mcap) / max(base_mcap, 1.0)) * 100.0
 
-                                logging.info(f"Token: {token_addr[:8]}... | Vol: ${vol_5m:,.0f} ({vol_growth:+.1f}%) | MCap: ${mcap:,.0f} ({mcap_growth:+.1f}%)")
+                                # Check Directional Trigger Criteria
+                                is_pump = mcap_growth >= PUMP_5M_MIN and vol_5m >= MIN_5M_VOLUME
+                                is_dump = mcap_growth <= DUMP_5M_MIN and vol_5m >= MIN_5M_VOLUME
 
-                                if vol_5m >= MIN_5M_VOLUME and vol_growth >= MIN_5M_VOL_EXPANSION and mcap_growth >= MIN_5M_MCAP_EXPANSION:
+                                if is_pump or is_dump:
                                     alert_key = f"{token_addr}_{int(now // 300)}"
-                                    
                                     async with STATE_LOCK:
                                         already_seen = alert_key in SEEN_TOKENS
 
                                     if not already_seen:
                                         sec_info = await check_goplus_security(session, chain, token_addr)
                                         if sec_info.get("status") != "UNSAFE":
-                                            await dispatch_telegram_alert(app, pair, sec_info, vol_growth, mcap_growth)
+                                            alert_type = "BULLISH_PUMP" if is_pump else "BEARISH_DUMP"
+                                            await dispatch_telegram_alert(app, pair, sec_info, mcap_growth, alert_type)
                                             async with STATE_LOCK:
                                                 SEEN_TOKENS.add(alert_key)
-                                            await save_state_async()
-
                 except Exception as e:
-                    logging.error(f"Market scanning cycle error: {e}")
+                    logging.error(f"Market monitor cycle error: {e}")
 
             await asyncio.sleep(POLL_INTERVAL)
 
 # ==========================================
-# COMMAND HANDLERS
-# ==========================================
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /add <TOKEN_ADDRESS>")
-        return
-
-    addr = normalize_address(context.args[0])
-    async with STATE_LOCK:
-        WATCHLIST.add(addr)
-    await save_state_async()
-    await update.message.reply_text(f"✅ Added to scanner: <code>{addr}</code>", parse_mode="HTML")
-
-async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_USER_IDS:
-        return
-
-    if not context.args:
-        await update.message.reply_text("Usage: /remove <TOKEN_ADDRESS>")
-        return
-
-    addr = normalize_address(context.args[0])
-    async with STATE_LOCK:
-        WATCHLIST.discard(addr)
-    await save_state_async()
-    await update.message.reply_text(f"❌ Removed from scanner: <code>{addr}</code>", parse_mode="HTML")
-
-# ==========================================
-# HEALTH SERVER & BOT LAUNCH
+# SERVER & APPLICATION LAUNCH
 # ==========================================
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -335,17 +285,15 @@ def run_health_check_server():
     server.serve_forever()
 
 async def main():
-    await load_state_async()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("remove", cmd_remove))
-
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
-    logging.info("Bot initiated successfully with Insider Security Metrics.")
+    # Start background tasks
+    asyncio.create_task(listen_j7_tracker_ws())
+    
+    logging.info("Bot operational with J7 Tracker Ingestion & Directional Pump/Dump Monitoring.")
     await monitor_market(app)
 
 if __name__ == "__main__":
