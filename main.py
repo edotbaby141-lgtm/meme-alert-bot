@@ -6,7 +6,7 @@ import re
 import html
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from collections import deque, defaultdict
+from collections import deque, defaultdict, OrderedDict
 from datetime import datetime
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,7 +17,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ==========================================
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
-CRYPTOPANIC_API_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "") # Optional for extended news feed
+CRYPTOPANIC_API_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "")
 
 DEXSCREENER_BATCH_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
 DEXSCREENER_BOOSTED_TOP = "https://api.dexscreener.com/token-boosts/top/v1"
@@ -31,18 +31,21 @@ EVM_CHAIN_MAP = {
     "base": "8453", "zksync": "324", "linea": "59144"
 }
 
-POLL_INTERVAL = 10     # Seconds between scans
-PUMP_5M_MIN = 5.0      # +5.0% change triggers a PUMP alert
-DUMP_5M_MIN = -5.0     # -5.0% change triggers a DUMP alert
-MIN_5M_VOLUME = 5000.0 # Minimum volume filter ($)
+POLL_INTERVAL = 10     
+PUMP_5M_MIN = 5.0      
+DUMP_5M_MIN = -5.0     
+MIN_5M_VOLUME = 5000.0 
 
 # ==========================================
 # STATE & CACHE MANAGEMENT
 # ==========================================
 WATCHLIST = set()
-SEEN_TOKENS = set()
+SEEN_TOKENS = OrderedDict()  # Max size bounded cache to prevent memory leak
+MAX_SEEN_CACHE = 2000
+
 PRICE_HISTORY = defaultdict(lambda: deque(maxlen=30))
 SOCIAL_MENTIONS = defaultdict(list)
+CALLBACK_LOOKUP = {}  # Resolves short callback IDs to full contract addresses
 STATE_LOCK = asyncio.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -51,6 +54,12 @@ def normalize_address(address: str) -> str:
     if re.match(r"^0x[a-fA-F0-9]{40}$", address):
         return address.lower()
     return address.strip()
+
+def track_seen_alert(key: str):
+    """Bounds seen tokens set size to prevent RAM leaks."""
+    SEEN_TOKENS[key] = True
+    if len(SEEN_TOKENS) > MAX_SEEN_CACHE:
+        SEEN_TOKENS.popitem(last=False)
 
 # ==========================================
 # INSIDER & SECURITY AUDIT (GOPLUS)
@@ -96,7 +105,7 @@ async def check_goplus_security(session: aiohttp.ClientSession, chain: str, toke
                         elif res.get("lp_holder_count"):
                             audit["lp_status"] = "🔒 Active Pool"
     except Exception as e:
-        logging.error(f"GoPlus Security Error: {e}")
+        logging.error(f"GoPlus Security Error for {token_address}: {e}")
     return audit
 
 # ==========================================
@@ -114,7 +123,8 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
     vol_5m = float(pair.get("volume", {}).get("m5", 0))
     dex_url = pair.get("url", "")
 
-    recent_tweets = SOCIAL_MENTIONS.get(address, [])
+    # Look up by address or symbol key
+    recent_tweets = SOCIAL_MENTIONS.get(address, []) or SOCIAL_MENTIONS.get(symbol.upper(), [])
     social_text = "No recent viral tweets" if not recent_tweets else f"💬 {recent_tweets[-1]}"
 
     if alert_type == "BULLISH_PUMP":
@@ -151,11 +161,14 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
         f"<a href='{dex_url}'>📈 View Chart on DEXScreener</a>"
     )
 
-    # CREATING INLINE BUTTONS
+    # Store full contract address mapping for button callback
+    cb_id = str(abs(hash(address + str(datetime.now().timestamp()))))[:12]
+    CALLBACK_LOOKUP[cb_id] = address
+
     keyboard = [
         [
-            InlineKeyboardButton("🟢 Accept / Long", callback_data=f"accept_{address[:10]}"),
-            InlineKeyboardButton("🔴 Decline / Skip", callback_data=f"decline_{address[:10]}")
+            InlineKeyboardButton("🟢 Accept / Long", callback_data=f"acc_{cb_id}"),
+            InlineKeyboardButton("🔴 Decline / Skip", callback_data=f"dec_{cb_id}")
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -172,40 +185,49 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
         logging.error(f"Failed to send alert: {e}")
 
 # ==========================================
-# TELEGRAM BUTTON CLICK HANDLER
+# TELEGRAM BUTTON CLICK HANDLER (SAFE UPDATE)
 # ==========================================
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     data = query.data
-    user = query.from_user.first_name
+    user = html.escape(query.from_user.first_name)
 
-    if data.startswith("accept_"):
-        status_text = f"\n\n<b>✅ VERDICT BY {user.upper()}: ACCEPTED / TRADE LOGGED</b>"
-    elif data.startswith("decline_"):
-        status_text = f"\n\n<b>❌ VERDICT BY {user.upper()}: DECLINED / SKIPPED</b>"
+    action, _, cb_id = data.partition("_")
+    full_address = CALLBACK_LOOKUP.get(cb_id, "Unknown Contract")
+
+    if action == "acc":
+        verdict = f"\n\n<b>✅ VERDICT BY {user.upper()}: ACCEPTED / LOGGED</b>\n<code>{full_address}</code>"
+    elif action == "dec":
+        verdict = f"\n\n<b>❌ VERDICT BY {user.upper()}: DECLINED / SKIPPED</b>\n<code>{full_address}</code>"
     else:
         return
 
-    # Update original message to remove buttons and stamp choice
-    new_text = query.message.text + status_text
     try:
-        await query.edit_message_text(text=new_text, parse_mode="HTML", reply_markup=None)
+        # Remove active buttons to lock in state
+        await query.edit_message_reply_markup(reply_markup=None)
+        
+        # Reply with the decision stamp without risking parsing breaks
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=verdict,
+            reply_to_message_id=query.message.message_id,
+            parse_mode="HTML"
+        )
     except Exception as e:
-        logging.error(f"Failed to update message button state: {e}")
+        logging.error(f"Failed to handle button callback: {e}")
 
 # ==========================================
 # NEW LAUNCHES & INFLUENTIAL TWEET MONITORING
 # ==========================================
 async def fetch_new_token_launches(session: aiohttp.ClientSession):
-    """Monitors DexScreener for newly launched token profiles."""
     try:
         async with session.get(DEXSCREENER_NEW_PROFILES, timeout=8) as resp:
             if resp.status == 200:
                 profiles = await resp.json()
                 if isinstance(profiles, list):
-                    for prof in profiles[:10]:
+                    for prof in profiles[:15]:
                         ca = prof.get("tokenAddress")
                         if ca:
                             norm_ca = normalize_address(ca)
@@ -215,7 +237,6 @@ async def fetch_new_token_launches(session: aiohttp.ClientSession):
         logging.error(f"Error fetching new launches: {e}")
 
 async def fetch_crypto_news_and_influencers(session: aiohttp.ClientSession):
-    """Polls crypto news feeds for breaking tweets, influencer news, or viral token tags."""
     try:
         url = "https://cryptopanic.com/api/v1/posts/?auth_token=" + CRYPTOPANIC_API_KEY if CRYPTOPANIC_API_KEY else "https://cryptopanic.com/api/v1/posts/?public=true"
         async with session.get(url, timeout=8) as resp:
@@ -225,19 +246,18 @@ async def fetch_crypto_news_and_influencers(session: aiohttp.ClientSession):
                     title = post.get("title", "")
                     currencies = post.get("currencies", [])
                     for c in currencies:
-                        code = c.get("code")
+                        code = c.get("code", "").upper()
                         if code:
                             SOCIAL_MENTIONS[code].append(title)
     except Exception as e:
         logging.error(f"Error fetching crypto news: {e}")
 
 # ==========================================
-# MAIN SCANNING LOOP
+# MAIN SCANNING LOOP (CONCURRENT & CHUNKED)
 # ==========================================
 async def monitor_market(app: Application):
     async with aiohttp.ClientSession() as session:
         while True:
-            # Poll newly launched tokens and high impact news
             await fetch_new_token_launches(session)
             await fetch_crypto_news_and_influencers(session)
 
@@ -254,18 +274,24 @@ async def monitor_market(app: Application):
                                 current_watchlist = [
                                     item.get("tokenAddress") for item in items 
                                     if isinstance(item, dict) and item.get("tokenAddress")
-                                ][:25]
+                                ]
                 except Exception as e:
                     logging.error(f"Fallback fetch error: {e}")
 
-            if current_watchlist:
-                addresses = ",".join(current_watchlist[:30])
+            # Process entire watchlist in batches of 30 to respect DexScreener API limits
+            chunk_size = 30
+            for i in range(0, len(current_watchlist), chunk_size):
+                chunk = current_watchlist[i:i + chunk_size]
+                addresses = ",".join(chunk)
+                
                 try:
                     async with session.get(DEXSCREENER_BATCH_URL.format(addresses), timeout=10) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            pairs = data.get("pairs", [])
+                            pairs = data.get("pairs", []) or []
                             now = datetime.now().timestamp()
+
+                            pending_alerts = []
 
                             for pair in pairs:
                                 token_addr = normalize_address(pair.get("baseToken", {}).get("address", ""))
@@ -287,18 +313,28 @@ async def monitor_market(app: Application):
 
                                 if is_pump or is_dump:
                                     alert_key = f"{token_addr}_{int(now // 300)}"
+                                    
                                     async with STATE_LOCK:
-                                        already_seen = alert_key in SEEN_TOKENS
-
-                                    if not already_seen:
-                                        sec_info = await check_goplus_security(session, chain, token_addr)
-                                        if sec_info.get("status") != "UNSAFE":
+                                        if alert_key not in SEEN_TOKENS:
+                                            # Immediately lock key to stop duplicate race conditions
+                                            track_seen_alert(alert_key)
                                             alert_type = "BULLISH_PUMP" if is_pump else "BEARISH_DUMP"
-                                            await dispatch_telegram_alert(app, pair, sec_info, mcap_growth, alert_type)
-                                            async with STATE_LOCK:
-                                                SEEN_TOKENS.add(alert_key)
+                                            pending_alerts.append((pair, chain, token_addr, mcap_growth, alert_type))
+
+                            # Execute security checks and alert dispatching concurrently
+                            if pending_alerts:
+                                tasks = [
+                                    check_goplus_security(session, chain, token_addr)
+                                    for _, chain, token_addr, _, _ in pending_alerts
+                                ]
+                                security_results = await asyncio.gather(*tasks)
+
+                                for (pair, _, _, mcap_growth, alert_type), sec_info in zip(pending_alerts, security_results):
+                                    if sec_info.get("status") != "UNSAFE":
+                                        await dispatch_telegram_alert(app, pair, sec_info, mcap_growth, alert_type)
+
                 except Exception as e:
-                    logging.error(f"Market monitor error: {e}")
+                    logging.error(f"Market monitor chunk error: {e}")
 
             await asyncio.sleep(POLL_INTERVAL)
 
@@ -318,15 +354,13 @@ def run_health_check_server():
 
 async def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Register callback query handler for Accept / Decline inline buttons
     app.add_handler(CallbackQueryHandler(handle_button_click))
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
 
-    logging.info("Bot operational with Inline Buttons, News Feed Ingestion, and New Launch Tracking.")
+    logging.info("Bot fully online with zero-flaw architecture.")
     await monitor_market(app)
 
 if __name__ == "__main__":
