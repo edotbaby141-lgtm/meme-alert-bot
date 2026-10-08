@@ -35,17 +35,19 @@ POLL_INTERVAL = 10
 PUMP_5M_MIN = 5.0      
 DUMP_5M_MIN = -5.0     
 MIN_5M_VOLUME = 5000.0 
+MIN_LIQUIDITY_USD = 10000.0  # RUG PULL FILTER: Minimum $10k pool liquidity required
 
 # ==========================================
 # STATE & CACHE MANAGEMENT
 # ==========================================
 WATCHLIST = set()
-SEEN_TOKENS = OrderedDict()  # Max size bounded cache to prevent memory leak
+SEEN_TOKENS = OrderedDict()
 MAX_SEEN_CACHE = 2000
 
 PRICE_HISTORY = defaultdict(lambda: deque(maxlen=30))
+TOKEN_IMAGES = {}
 SOCIAL_MENTIONS = defaultdict(list)
-CALLBACK_LOOKUP = {}  # Resolves short callback IDs to full contract addresses
+CALLBACK_LOOKUP = {}
 STATE_LOCK = asyncio.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -56,13 +58,12 @@ def normalize_address(address: str) -> str:
     return address.strip()
 
 def track_seen_alert(key: str):
-    """Bounds seen tokens set size to prevent RAM leaks."""
     SEEN_TOKENS[key] = True
     if len(SEEN_TOKENS) > MAX_SEEN_CACHE:
         SEEN_TOKENS.popitem(last=False)
 
 # ==========================================
-# INSIDER & SECURITY AUDIT (GOPLUS)
+# RUG PULL & SECURITY CHECK (GOPLUS)
 # ==========================================
 async def check_goplus_security(session: aiohttp.ClientSession, chain: str, token_address: str) -> dict:
     chain_lower = chain.lower()
@@ -109,7 +110,7 @@ async def check_goplus_security(session: aiohttp.ClientSession, chain: str, toke
     return audit
 
 # ==========================================
-# ALERT DISPATCH ENGINE WITH INLINE BUTTONS
+# ALERT DISPATCH ENGINE WITH IMAGES & WHALE DATA
 # ==========================================
 async def dispatch_telegram_alert(app: Application, pair: dict, security_info: dict, mcap_change: float, alert_type: str):
     base_token = pair.get("baseToken", {})
@@ -121,16 +122,32 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
     price_usd = float(pair.get("priceUsd", 0))
     mcap = float(pair.get("fdv", pair.get("marketCap", 0)))
     vol_5m = float(pair.get("volume", {}).get("m5", 0))
+    liquidity_usd = float(pair.get("liquidity", {}).get("usd", 0))
     dex_url = pair.get("url", "")
 
-    # Look up by address or symbol key
+    # Retrieve image icon if available
+    img_url = TOKEN_IMAGES.get(address)
+
+    # Dynamic Hold & Sell Strategy based on Liquidity/Volume Ratio
+    if liquidity_usd > 100000:
+        hold_time = "🕒 Hold: 30 mins to 2 hours (High Liquidity)"
+    elif liquidity_usd > 25000:
+        hold_time = "⚡ Hold: 10 to 30 mins (Quick Scalp)"
+    else:
+        hold_time = "⚠️ Hold: 2 to 10 mins MAX (Low Liquidity - Take Fast Profits)"
+
+    # Detect Big Trader / Whale Pressure
+    buys_5m = pair.get("txns", {}).get("m5", {}).get("buys", 0)
+    sells_5m = pair.get("txns", {}).get("m5", {}).get("sells", 0)
+    whale_activity = "🐳 Whale Accumulation" if buys_5m > (sells_5m * 2) else "⚖️ Balanced Trading"
+
     recent_tweets = SOCIAL_MENTIONS.get(address, []) or SOCIAL_MENTIONS.get(symbol.upper(), [])
     social_text = "No recent viral tweets" if not recent_tweets else f"💬 {recent_tweets[-1]}"
 
     if alert_type == "BULLISH_PUMP":
         header = f"🚀 <b>BULLISH PUMP DETECTED (+{mcap_change:.1f}%)</b>"
         action = "🟢 ACCORDING TO SYSTEM: ACCEPT / BULLISH ENTRY"
-        tp1, sl = price_usd * 1.30, price_usd * 0.88
+        tp1, sl = price_usd * 1.25, price_usd * 0.90
     else:
         header = f"🚨 <b>BEARISH DUMP DETECTED ({mcap_change:.1f}%)</b>"
         action = "🔴 ACCORDING TO SYSTEM: DECLINE / LIQUIDATE"
@@ -145,23 +162,25 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
         f"<b>Chain:</b> {chain}\n"
         f"<b>Security:</b> {sec_badge}\n"
         f"<b>Action Guidance:</b> <code>{action}</code>\n\n"
+        f"<b>Price USD:</b> ${price_usd:.8f}\n"
+        f"<b>Liquidity:</b> ${liquidity_usd:,.0f}\n"
         f"<b>Market Cap:</b> ${mcap:,.0f} (<b>{mcap_change:+.1f}%</b> in 5m)\n"
         f"<b>5m Volume:</b> ${vol_5m:,.0f}\n"
-        f"<b>Current Price:</b> ${price_usd:.8f}\n\n"
-        f"<b>🐦 HIGH IMPACT NEWS & X (TWITTER) SIGNALS</b>\n"
+        f"<b>DEX Activity:</b> {whale_activity} ({buys_5m} Buys / {sells_5m} Sells)\n\n"
+        f"<b>⏱️ RECOMMENDED TIMEFRAME</b>\n"
+        f"<b>Strategy:</b> {hold_time}\n"
+        f"<b>Take Profit Target:</b> ${tp1:.8f}\n"
+        f"<b>Stop Loss Threshold:</b> ${sl:.8f}\n\n"
+        f"<b>🐦 HIGH IMPACT NEWS & SOCIALS</b>\n"
         f"<code>{html.escape(social_text)}</code>\n\n"
-        f"<b>🕵️ INSIDER DATA</b>\n"
+        f"<b>🕵️ INSIDER & RUG AUDIT</b>\n"
         f"<b>Dev Holdings:</b> {security_info.get('dev_pct')}\n"
         f"<b>Mintable:</b> {security_info.get('is_mintable')}\n"
         f"<b>LP Status:</b> {security_info.get('lp_status')}\n\n"
-        f"<b>🎯 EXECUTION SETUP</b>\n"
-        f"<b>Take Profit Target:</b> ${tp1:.8f}\n"
-        f"<b>Stop Loss Threshold:</b> ${sl:.8f}\n\n"
         f"<b>Contract:</b> <code>{address}</code>\n"
         f"<a href='{dex_url}'>📈 View Chart on DEXScreener</a>"
     )
 
-    # Store full contract address mapping for button callback
     cb_id = str(abs(hash(address + str(datetime.now().timestamp()))))[:12]
     CALLBACK_LOOKUP[cb_id] = address
 
@@ -174,18 +193,27 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
-        await app.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=msg,
-            parse_mode="HTML",
-            reply_markup=reply_markup,
-            disable_web_page_preview=True
-        )
+        if img_url:
+            await app.bot.send_photo(
+                chat_id=TELEGRAM_CHAT_ID,
+                photo=img_url,
+                caption=msg,
+                parse_mode="HTML",
+                reply_markup=reply_markup
+            )
+        else:
+            await app.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=msg,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
     except Exception as e:
-        logging.error(f"Failed to send alert: {e}")
+        logging.error(f"Failed to send alert with image: {e}")
 
 # ==========================================
-# TELEGRAM BUTTON CLICK HANDLER (SAFE UPDATE)
+# BUTTON HANDLER
 # ==========================================
 async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -205,10 +233,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        # Remove active buttons to lock in state
         await query.edit_message_reply_markup(reply_markup=None)
-        
-        # Reply with the decision stamp without risking parsing breaks
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=verdict,
@@ -219,7 +244,7 @@ async def handle_button_click(update: Update, context: ContextTypes.DEFAULT_TYPE
         logging.error(f"Failed to handle button callback: {e}")
 
 # ==========================================
-# NEW LAUNCHES & INFLUENTIAL TWEET MONITORING
+# IMAGE ICON & NEW LAUNCH INGESTION
 # ==========================================
 async def fetch_new_token_launches(session: aiohttp.ClientSession):
     try:
@@ -229,37 +254,23 @@ async def fetch_new_token_launches(session: aiohttp.ClientSession):
                 if isinstance(profiles, list):
                     for prof in profiles[:15]:
                         ca = prof.get("tokenAddress")
+                        icon = prof.get("icon")
                         if ca:
                             norm_ca = normalize_address(ca)
+                            if icon:
+                                TOKEN_IMAGES[norm_ca] = icon
                             async with STATE_LOCK:
                                 WATCHLIST.add(norm_ca)
     except Exception as e:
-        logging.error(f"Error fetching new launches: {e}")
-
-async def fetch_crypto_news_and_influencers(session: aiohttp.ClientSession):
-    try:
-        url = "https://cryptopanic.com/api/v1/posts/?auth_token=" + CRYPTOPANIC_API_KEY if CRYPTOPANIC_API_KEY else "https://cryptopanic.com/api/v1/posts/?public=true"
-        async with session.get(url, timeout=8) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                for post in data.get("results", [])[:5]:
-                    title = post.get("title", "")
-                    currencies = post.get("currencies", [])
-                    for c in currencies:
-                        code = c.get("code", "").upper()
-                        if code:
-                            SOCIAL_MENTIONS[code].append(title)
-    except Exception as e:
-        logging.error(f"Error fetching crypto news: {e}")
+        logging.error(f"Error fetching token profiles and images: {e}")
 
 # ==========================================
-# MAIN SCANNING LOOP (CONCURRENT & CHUNKED)
+# MAIN SCANNING LOOP
 # ==========================================
 async def monitor_market(app: Application):
     async with aiohttp.ClientSession() as session:
         while True:
             await fetch_new_token_launches(session)
-            await fetch_crypto_news_and_influencers(session)
 
             async with STATE_LOCK:
                 current_watchlist = list(WATCHLIST)
@@ -278,7 +289,6 @@ async def monitor_market(app: Application):
                 except Exception as e:
                     logging.error(f"Fallback fetch error: {e}")
 
-            # Process entire watchlist in batches of 30 to respect DexScreener API limits
             chunk_size = 30
             for i in range(0, len(current_watchlist), chunk_size):
                 chunk = current_watchlist[i:i + chunk_size]
@@ -298,6 +308,11 @@ async def monitor_market(app: Application):
                                 chain = pair.get("chainId", "")
                                 vol_5m = float(pair.get("volume", {}).get("m5", 0))
                                 mcap = float(pair.get("fdv", pair.get("marketCap", 0)))
+                                liquidity_usd = float(pair.get("liquidity", {}).get("usd", 0))
+
+                                # RUG PULL FILTER: Reject low-liquidity coins instantly
+                                if liquidity_usd < MIN_LIQUIDITY_USD:
+                                    continue
 
                                 history = PRICE_HISTORY[token_addr]
                                 history.append((now, vol_5m, mcap))
@@ -316,12 +331,10 @@ async def monitor_market(app: Application):
                                     
                                     async with STATE_LOCK:
                                         if alert_key not in SEEN_TOKENS:
-                                            # Immediately lock key to stop duplicate race conditions
                                             track_seen_alert(alert_key)
                                             alert_type = "BULLISH_PUMP" if is_pump else "BEARISH_DUMP"
                                             pending_alerts.append((pair, chain, token_addr, mcap_growth, alert_type))
 
-                            # Execute security checks and alert dispatching concurrently
                             if pending_alerts:
                                 tasks = [
                                     check_goplus_security(session, chain, token_addr)
@@ -358,9 +371,11 @@ async def main():
 
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()
+    
+    # Drops pending updates on launch to avoid 409 conflicts
+    await app.updater.start_polling(drop_pending_updates=True)
 
-    logging.info("Bot fully online with zero-flaw architecture.")
+    logging.info("Bot online with Liquidity Checks, Whale Tracking, and Anti-Rug Protection.")
     await monitor_market(app)
 
 if __name__ == "__main__":
