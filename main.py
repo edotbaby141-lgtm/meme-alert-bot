@@ -15,8 +15,9 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ==========================================
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ==========================================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID")
+# New updated Bot Token:
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8804502384:AAGZ7MjOc52VX6pHbmjq_57OWyTLSaB-8LI")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5642314005")
 CRYPTOPANIC_API_KEY = os.environ.get("CRYPTOPANIC_API_KEY", "")
 
 DEXSCREENER_BATCH_URL = "https://api.dexscreener.com/latest/dex/tokens/{}"
@@ -35,13 +36,13 @@ POLL_INTERVAL = 10
 PUMP_5M_MIN = 5.0      
 DUMP_5M_MIN = -5.0     
 MIN_5M_VOLUME = 5000.0 
-MIN_LIQUIDITY_USD = 10000.0  # RUG PULL FILTER: Minimum $10k pool liquidity required
+MIN_LIQUIDITY_USD = 10000.0  # RUG PULL FILTER: Rejects pools with < $10k liquidity
 
 # ==========================================
 # STATE & CACHE MANAGEMENT
 # ==========================================
 WATCHLIST = set()
-SEEN_TOKENS = OrderedDict()
+SEEN_TOKENS = OrderedDict()  # Max size bounded cache to prevent RAM memory leaks
 MAX_SEEN_CACHE = 2000
 
 PRICE_HISTORY = defaultdict(lambda: deque(maxlen=30))
@@ -58,6 +59,7 @@ def normalize_address(address: str) -> str:
     return address.strip()
 
 def track_seen_alert(key: str):
+    """Bounds seen tokens set size to prevent server RAM memory leaks."""
     SEEN_TOKENS[key] = True
     if len(SEEN_TOKENS) > MAX_SEEN_CACHE:
         SEEN_TOKENS.popitem(last=False)
@@ -130,7 +132,7 @@ async def dispatch_telegram_alert(app: Application, pair: dict, security_info: d
 
     # Dynamic Hold & Sell Strategy based on Liquidity/Volume Ratio
     if liquidity_usd > 100000:
-        hold_time = "🕒 Hold: 30 mins to 2 hours (High Liquidity)"
+        hold_time = "🕒 Hold: 30 mins to 2 hours (High Liquidity Pool)"
     elif liquidity_usd > 25000:
         hold_time = "⚡ Hold: 10 to 30 mins (Quick Scalp)"
     else:
@@ -372,10 +374,10 @@ async def main():
     await app.initialize()
     await app.start()
     
-    # Drops pending updates on launch to avoid 409 conflicts
+    # Drops pending updates on launch to avoid HTTP 409 conflict errors
     await app.updater.start_polling(drop_pending_updates=True)
 
-    logging.info("Bot online with Liquidity Checks, Whale Tracking, and Anti-Rug Protection.")
+    logging.info("Bot online with updated token: 8804502384:AAGZ7MjOc52VX6pHbmjq_57OWyTLSaB-8LI")
     await monitor_market(app)
 
 if __name__ == "__main__":
